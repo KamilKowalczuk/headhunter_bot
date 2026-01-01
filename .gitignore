@@ -2,7 +2,8 @@
 dist/
 # generated types
 .astro/
-
+.venv/
+venv/
 data/
 
 # dependencies
