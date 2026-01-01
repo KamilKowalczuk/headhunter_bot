@@ -3,6 +3,7 @@ import re
 import requests
 import json
 import logging
+import html
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from sqlalchemy.orm import Session
@@ -28,258 +29,274 @@ firecrawl_key = os.getenv("FIRECRAWL_API_KEY")
 if not firecrawl_key:
     raise ValueError("❌ CRITICAL: Brak FIRECRAWL_API_KEY w .env.")
 
-# Model AI - Zwiększamy temperaturę minimalnie dla kreatywności w 'icebreaker'
+# Model AI
 llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.1, google_api_key=gemini_key)
 structured_llm = llm.with_structured_output(CompanyResearch)
 
 # --- NARZĘDZIA POMOCNICZE (SNIPER TOOLS) ---
 
-def extract_emails_via_regex(text: str) -> list:
-    """Szybki regex do wyłapywania maili przed AI."""
-    if not text: return []
-    # Ulepszony regex (odrzuca pliki graficzne w środku maila)
-    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-    found = re.findall(email_pattern, text)
-    unique = list(set(email.lower() for email in found))
+def extract_emails_from_html(raw_html: str) -> list:
+    """Ekstrakcja z BRUDNEGO HTMLa (X-RAY)."""
+    if not raw_html: return []
     
+    text = html.unescape(raw_html)
+    emails = []
+    
+    # 1. Linki mailto (Priorytet)
+    mailto_pattern = r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'
+    emails.extend(re.findall(mailto_pattern, text))
+    
+    # 2. Tekst
+    text_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    emails.extend(re.findall(text_pattern, text))
+    
+    unique = list(set(e.lower() for e in emails))
     clean = []
     for email in unique:
-        # Filtry antyspamowe/antyassetowe
-        if email.endswith(('.png', '.jpg', '.jpeg', '.gif', '.css', '.js', '.svg', '.woff')): continue
-        if any(x in email for x in ['sentry', 'noreply', 'no-reply', 'example', 'domain', 'email']): continue
+        if email.endswith(('.png', '.jpg', '.jpeg', '.gif', '.css', '.js', '.svg', '.woff', '.webp', '.mp4')): continue
+        if any(x in email for x in ['sentry', 'noreply', 'no-reply', 'example', 'domain', 'email.com', 'bootstrap', 'react']): continue
         if len(email) < 5 or len(email) > 60: continue
         clean.append(email)
+        
     return clean
 
 class TitanScraper:
-    """Klient Firecrawl z obsługą błędów i timeoutów."""
+    """Klient Firecrawl - Tryb Hybrydowy."""
     def __init__(self, api_key):
         self.api_key = api_key
         self.base_url = "https://api.firecrawl.dev/v1"
         self.headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    def scrape(self, url, check_hiring=False):
-        """Pobiera treść. Opcjonalnie szuka słów kluczowych rekrutacji."""
+    def scrape(self, url):
+        """Pobiera HTML (dla Regexa) i Markdown (dla AI)."""
         endpoint = f"{self.base_url}/scrape"
         payload = {
             "url": url, 
-            "formats": ["markdown"],
-            "onlyMainContent": True, # Oszczędność tokenów - tylko mięso
-            "timeout": 15000
+            "formats": ["markdown", "html"], 
+            "onlyMainContent": False, # WAŻNE: Pobieramy stopki!
+            "timeout": 20000,
+            "excludeTags": ["script", "style", "video", "canvas"] 
         }
         try:
-            response = requests.post(endpoint, headers=self.headers, json=payload, timeout=20)
+            response = requests.post(endpoint, headers=self.headers, json=payload, timeout=30)
             if response.status_code == 200:
-                data = response.json()
-                content = data.get('data', {}).get('markdown', "")
-                return content
-            elif response.status_code == 429:
-                logger.warning(f"Rate limit Firecrawl na {url}")
-                return ""
-            return ""
+                data = response.json().get('data', {})
+                # Sprawdzenie czy dostaliśmy treść
+                if not data.get('markdown') and not data.get('html'):
+                    return None
+                return {
+                    "markdown": data.get('markdown', ""),
+                    "html": data.get('html', "")
+                }
+            return None
         except Exception as e:
             logger.error(f"Błąd scrapowania {url}: {e}")
-            return ""
+            return None
 
     def map_site(self, url):
-        """Mapuje stronę w poszukiwaniu podstron."""
+        """Mapuje stronę."""
         endpoint = f"{self.base_url}/map"
         payload = {"url": url, "search": "contact about team career kontakt o-nas zespol kariera"}
         try:
-            response = requests.post(endpoint, headers=self.headers, json=payload, timeout=15)
+            response = requests.post(endpoint, headers=self.headers, json=payload, timeout=10) # Krótki timeout na mapę
             if response.status_code == 200:
                 data = response.json()
-                return data.get('links', []) if 'links' in data else data.get('data', {}).get('links', [])
+                return data.get('links', []) or data.get('data', {}).get('links', [])
             return []
         except:
             return []
 
 scraper = TitanScraper(firecrawl_key)
 
-def _parallel_scrape(urls: list) -> str:
-    """
-    Równoległe pobieranie treści z wielu URLi.
-    To jest GAME CHANGER dla wydajności.
-    """
-    full_content = ""
+def _parallel_scrape(urls: list) -> dict:
+    """Wielowątkowe pobieranie."""
+    combined_markdown = ""
+    all_html_emails = []
+    
+    # Usuwamy duplikaty URLi przed startem
+    urls = list(set(urls))
+    
+    print(f"         🚀 Uruchamiam {len(urls)} wątków scrapingowych...")
+    
     with ThreadPoolExecutor(max_workers=5) as executor:
         future_to_url = {executor.submit(scraper.scrape, url): url for url in urls}
         for future in as_completed(future_to_url):
             url = future_to_url[future]
             try:
-                data = future.result()
-                if data and len(data) > 50:
-                    # Dodajemy nagłówek, żeby AI wiedziało skąd jest tekst
-                    section_name = "STRONA GŁÓWNA"
-                    if "contact" in url or "kontakt" in url: section_name = "KONTAKT"
-                    elif "about" in url or "o-nas" in url: section_name = "O NAS"
-                    elif "career" in url or "kariera" in url: section_name = "KARIERA/PRACA"
+                result = future.result()
+                if result:
+                    # 1. Regex z HTML
+                    if result.get("html"):
+                        found = extract_emails_from_html(result["html"])
+                        if found:
+                            print(f"            👀 Znaleziono w HTML ({url}): {found}")
+                            all_html_emails.extend(found)
                     
-                    full_content += f"\n\n=== {section_name} ({url}) ===\n{data[:15000]}" # Limit na podstronę
+                    # 2. Markdown dla AI
+                    md = result.get("markdown", "")
+                    if len(md) > 50:
+                        section_name = "STRONA"
+                        if "contact" in url or "kontakt" in url: section_name = "KONTAKT"
+                        elif "about" in url or "o-nas" in url: section_name = "O NAS"
+                        
+                        combined_markdown += f"\n\n=== {section_name} ({url}) ===\n{md[:15000]}"
             except Exception as e:
-                logger.error(f"Błąd w wątku dla {url}: {e}")
-    return full_content
+                logger.error(f"Błąd wątku {url}: {e}")
+                
+    return {
+        "markdown": combined_markdown,
+        "regex_emails": list(set(all_html_emails))
+    }
 
 def _get_content_titan_strategy(url: str) -> str:
-    """Strategia Zwiadu: Mapowanie -> Wybór Celów -> Równoległy Atak."""
-    print(f"      🔥 [TITAN] Rozpoczynam skanowanie domeny: {url}")
+    """Strategia BULLDOZER: Mapowanie + Wymuszone Ścieżki."""
+    print(f"      🔥 [TITAN] Cel: {url}")
     
-    # 1. Mapowanie (szybkie)
-    links = scraper.map_site(url)
-    pages_to_scrape = [url] # Zawsze strona główna
+    # 1. Generujemy wymuszone ścieżki (Guessing)
+    base_url = url.rstrip('/')
+    forced_pages = [
+        base_url,
+        f"{base_url}/kontakt",
+        f"{base_url}/contact",
+        f"{base_url}/o-nas",
+        f"{base_url}/about"
+    ]
     
-    # 2. Inteligentny wybór celów
-    if links:
-        # Priorytety: Kontakt > O nas > Kariera (szukanie sygnałów zakupowych)
-        keywords_priority = {
-            "kontakt": 1, "contact": 1,
-            "o-nas": 2, "about": 2, "team": 2, "zespol": 2,
-            "kariera": 3, "career": 3, "jobs": 3, "praca": 3
-        }
-        
-        # Unikalne linki, sortowanie po priorytecie
-        scored_links = []
-        seen = set([url])
-        
-        for link in links:
-            if link in seen: continue
-            if any(ext in link.lower() for ext in ['.jpg', '.png', '.pdf', '.css', 'wp-content']): continue
-            
-            score = 10 # Domyślnie niski priorytet
-            for key, val in keywords_priority.items():
-                if key in link.lower():
-                    score = val
-                    break
-            
-            if score < 10: # Tylko jeśli znaleźliśmy słowo kluczowe
-                scored_links.append((score, link))
-                seen.add(link)
+    # 2. Próbujemy mapowania (dla pewności, może znajdzie 'kariera' albo 'zespol')
+    mapped_links = scraper.map_site(url)
+    
+    final_list = forced_pages.copy()
+    
+    if mapped_links:
+        # Filtrujemy mapę pod kątem słów kluczowych, których nie zgadliśmy (np. 'zespol', 'kariera')
+        keywords = ["team", "zespol", "kariera", "career", "praca"]
+        interesting = [l for l in mapped_links if any(k in l.lower() for k in keywords)]
+        final_list.extend(interesting[:2]) # Max 2 dodatkowe z mapy
 
-        # Sortujemy (1 najniższe = najważniejsze) i bierzemy max 3 dodatkowe podstrony
-        scored_links.sort(key=lambda x: x[0])
-        top_links = [x[1] for x in scored_links[:3]]
-        pages_to_scrape.extend(top_links)
-        
-        print(f"         🎯 Cele taktyczne: {[u.split('/')[-1] for u in pages_to_scrape[1:]]}")
-    else:
-        # Fallback manualny
-        base = url.rstrip('/')
-        pages_to_scrape.extend([f"{base}/kontakt", f"{base}/o-nas"])
+    # Usuwamy duplikaty i czyścimy śmieci
+    clean_urls = []
+    seen = set()
+    for u in final_list:
+        if u in seen: continue
+        if any(ext in u.lower() for ext in ['.pdf', '.jpg', '.png', '#']): continue
+        clean_urls.append(u)
+        seen.add(u)
 
-    # 3. Równoległe pobieranie (BŁYSKAWICZNE)
-    return _parallel_scrape(pages_to_scrape)
+    # Limit do 5 podstron max, żeby nie spalić tokenów, ale PRIORYTET mają KONTAKT
+    # Sortowanie: Kontakt na górę
+    clean_urls.sort(key=lambda x: 0 if 'kontakt' in x or 'contact' in x else 1)
+    target_urls = clean_urls[:5]
+
+    print(f"         🎯 Lista celów: {[u.split('/')[-1] for u in target_urls]}")
+    return _parallel_scrape(target_urls)
 
 def analyze_lead(session: Session, lead_id: int):
-    """
-    Główna funkcja analityczna.
-    """
+    """RESEARCHER V4: BULLDOZER EDITION"""
     lead = session.query(Lead).filter(Lead.id == lead_id).first()
     if not lead: return
 
     company = lead.company
-    print(f"\n   🔎 [RESEARCHER] Analizuję firmę: {company.name}")
+    print(f"\n   🔎 [RESEARCHER] Analiza: {company.name}")
     
-    # Normalizacja URL
     target_url = get_main_domain_url(company.domain)
     if not target_url.startswith("http"): target_url = "https://" + target_url
 
-    # 1. POBIERANIE DANYCH (ASYNC LOGIC WRAPPED)
-    content = _get_content_titan_strategy(target_url)
+    # 1. POBIERANIE (Bulldozer Strategy)
+    scan_result = _get_content_titan_strategy(target_url)
     
-    if not content:
-        print(f"      ❌ PUSTY ZWIAD. Oznaczam do ręcznego sprawdzenia.")
+    content_md = scan_result["markdown"]
+    regex_emails = scan_result["regex_emails"]
+
+    if not content_md and not regex_emails:
+        print(f"      ❌ PUSTY ZWIAD. Próba 404 na wszystkich podstronach.")
         lead.status = "MANUAL_CHECK"
         session.commit()
         return
 
-    # 2. EKSTRAKCJA REGEX (SAFEGUARD)
-    regex_emails = extract_emails_via_regex(content)
+    # 2. ANALIZA AI
+    print(f"      🧠 Gemini analizuje dane...")
+    
+    regex_hint = ""
     if regex_emails:
-        print(f"      👀 Regex znalazł: {regex_emails}")
+        regex_hint = (
+            f"ZNALAZŁEM NASTĘPUJĄCE MAILE W KODZIE HTML (TO SĄ FAKTY): {', '.join(regex_emails)}. "
+            f"DODAJ JE DO LISTY contact_emails."
+        )
 
-    # 3. ANALIZA SEMANTYCZNA AI (MÓZG)
-    print(f"      🧠 Uruchamiam Gemini 2.0 (Business Intelligence)...")
-    
     system_prompt = f"""
-    Jesteś elitarnym analitykiem sprzedaży B2B (Agency OS).
-    Twoim celem jest przygotowanie "amunicji" dla copywritera, aby sprzedać usługi tej firmie.
-    
-    DANE WEJŚCIOWE:
-    Strona WWW klienta (sekcje Home, Kontakt, O nas, Kariera).
+    Jesteś analitykiem B2B. Analizujesz surową treść HTML/Markdown z kilku podstron firmy.
     
     ZADANIE:
-    1. Zidentyfikuj **Stack Technologiczny** (jakich narzędzi używają? Wordpress? React? HubSpot?).
-    2. Znajdź **Sygnały Zakupowe (Hiring Signals)**. Czy rekrutują handlowców? Programistów? To oznacza, że mają budżet i potrzeby.
-    3. Znajdź **Decydentów**. Imiona, nazwiska, stanowiska.
-    4. Napisz **ICEBREAKER**. Jedno, genialne zdanie, które udowadnia, że zrobiliśmy research. Np. "Gratuluję nagrody X", "Widziałem, że szukacie Head of Sales".
-    5. Wybierz najlepszy **E-MAIL**.
+    1. **E-MAIL:** {regex_hint} Szukaj w sekcjach "Kontakt", "Stopka".
+    2. Stack Tech & Hiring.
+    3. Icebreaker.
     
-    Wskazówka od systemu (Regex): {', '.join(regex_emails) if regex_emails else 'Brak'}
-    Jeśli Regex znalazł maila, zweryfikuj go kontekstowo i użyj.
+    Priorytety maili: Imienne > Biuro/Kontakt/Hello > Sprzedaż.
+    Ignoruj: przykładowe domeny, webmasterów, grafikę.
     """
     
-    chain = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{text}")]).pipe(structured_llm)
-    
     try:
-        # Przekazujemy tekst, ale ucinamy go bezpiecznie do okna kontekstu (ok 60k znaków dla pewności)
-        research = chain.invoke({"text": content[:60000]})
+        chain = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{text}")]).pipe(structured_llm)
+        research = chain.invoke({"text": content_md[:70000]})
     except Exception as e:
         print(f"      ❌ Błąd LLM: {e}")
+        # RATUNEK REGEXEM
+        if regex_emails:
+            print("      ⚠️ LLM Error. Ratuję lead mailami z HTML.")
+            lead.target_email = regex_emails[0]
+            lead.status = "ANALYZED"
+            lead.ai_confidence_score = 50
+            lead.ai_analysis_summary = "HTML RESCUE MODE. LLM FAILED."
+            session.commit()
+            return
         lead.status = "MANUAL_CHECK"
         session.commit()
         return
 
-    # 4. LOGIKA WYBORU MAILA (SCORING)
-    valid_email = None
-    all_candidates = list(set((research.contact_emails or []) + regex_emails))
+    # 3. MERGE & SCORE
+    combined_emails = list(set((research.contact_emails or []) + regex_emails))
     
     def score_email(email):
         s = 0
         e = email.lower()
-        # Bonusy
-        if any(x in e for x in ['prezes', 'ceo', 'owner', 'dyrektor', 'head']): s += 10
-        if '.' in e.split('@')[0]: s += 5 # Format imie.nazwisko
-        if any(x in e for x in ['hello', 'contact', 'biuro', 'info']): s += 2
-        # Kary
-        if any(x in e for x in ['kariera', 'jobs', 'rekrutacja', 'no-reply', 'abuse']): s -= 100
-        if not verify_email_domain(e): s -= 50 # Sprawdzenie DNS
+        if any(x in e for x in ['ceo', 'owner', 'founder', 'prezes']): s += 20
+        if any(x in e for x in ['biuro', 'info', 'hello', 'kontakt', 'office']): s += 15 # <-- PODBITE
+        if '.' in e.split('@')[0]: s += 5
+        if any(x in e for x in ['kariera', 'jobs', 'rekrutacja']): s -= 20
+        if not verify_email_domain(e): s -= 100
         return s
 
-    if all_candidates:
-        # Sortuj malejąco po wyniku
-        scored_emails = sorted([(e, score_email(e)) for e in all_candidates], key=lambda x: x[1], reverse=True)
-        print(f"      📧 Scoring maili: {scored_emails}")
+    valid_email = None
+    if combined_emails:
+        scored = sorted([(e, score_email(e)) for e in combined_emails], key=lambda x: x[1], reverse=True)
+        print(f"      📧 Scoring: {scored}")
         
-        best_email, score = scored_emails[0]
-        if score > -20: # Próg akceptacji
+        best_email, score = scored[0]
+        if score > -20:
             valid_email = best_email
-        else:
-            print("      ⚠️ Wszystkie maile odrzucone (spam/kariera/dns).")
 
-    # 5. AKTUALIZACJA BAZY (COMMIT)
+    # 4. ZAPIS
     company.tech_stack = research.tech_stack
     company.decision_makers = research.decision_makers
-    company.industry = research.target_audience # Często ICP klienta mówi o jego branży
+    company.industry = research.target_audience
     company.last_scraped_at = datetime.utcnow()
     
-    # Budujemy potężne podsumowanie dla Writera
-    hiring_info = f"REKRUTUJĄ: {', '.join(research.hiring_signals)}" if research.hiring_signals else "Brak rekrutacji."
     lead.ai_analysis_summary = (
         f"ICEBREAKER: {research.icebreaker}\n"
         f"SUMMARY: {research.summary}\n"
-        f"ICP: {research.target_audience}\n"
-        f"{hiring_info}\n"
-        f"PAIN POINTS: {research.pain_points_or_opportunities}"
+        f"MAILS: {combined_emails}\n"
+        f"HIRING: {research.hiring_signals}\n"
+        f"PAIN: {research.pain_points_or_opportunities}"
     )
     
     if valid_email:
         lead.target_email = valid_email
-        lead.status = "ANALYZED" # Gotowy dla Writera
-        lead.ai_confidence_score = 95 # Wysokie zaufanie po głębokim researchu
-        print(f"      ✅ SUKCES: Lead gotowy. Target: {valid_email}")
+        lead.status = "ANALYZED"
+        lead.ai_confidence_score = 95
+        print(f"      ✅ SUKCES: {valid_email}")
     else:
-        lead.status = "MANUAL_CHECK" # Człowiek musi poszukać na LinkedIn
-        lead.ai_confidence_score = 20
-        print(f"      ⚠️ PARTIAL: Mamy dane, ale brak maila. Do ręcznej weryfikacji.")
+        lead.status = "MANUAL_CHECK"
+        lead.ai_confidence_score = 15
+        print(f"      ⚠️ MANUAL CHECK")
 
     session.commit()

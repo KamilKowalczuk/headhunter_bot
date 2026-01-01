@@ -1,4 +1,5 @@
 import os
+import logging
 from sqlalchemy.orm import Session
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -7,189 +8,202 @@ from dotenv import load_dotenv
 from app.database import Lead, Client, GlobalCompany
 from app.schemas import EmailDraft, AuditResult
 
+# Konfiguracja loggera
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("writer")
+
 load_dotenv()
 
-# Dwa modele: Jeden kreatywny (Pisarz), drugi surowy (Audytor)
+# Dwa modele: Writer (Kreatywny) i Auditor (Analityczny)
 writer_llm = ChatGoogleGenerativeAI(
     model="gemini-2.0-flash",
-    temperature=0.7, # Kreatywność włączona
+    temperature=0.75, # Zwiększona kreatywność dla lepszego flow
     google_api_key=os.getenv("GEMINI_API_KEY")
 ).with_structured_output(EmailDraft)
 
 auditor_llm = ChatGoogleGenerativeAI(
     model="gemini-2.0-flash",
-    temperature=0.0, # Zero litości, same fakty
+    temperature=0.0, # Zero litości
     google_api_key=os.getenv("GEMINI_API_KEY")
 ).with_structured_output(AuditResult)
 
 def generate_email(session: Session, lead_id: int):
     """
-    Proces: Pisanie -> Audyt -> (Ewentualna Poprawka) -> Zapis
+    MASTER PROCESS: Generowanie maila z wykorzystaniem pełnego DNA Klienta.
     """
     lead = session.query(Lead).filter(Lead.id == lead_id).first()
     if not lead or not lead.campaign or not lead.campaign.client:
-        print("❌ Błąd danych leada.")
+        logger.error(f"❌ Błąd danych leada ID {lead_id}.")
         return
 
     client = lead.campaign.client
     company = lead.company
     
-    print(f"✍️  WRITER: Piszę dla {company.name}...")
+    logger.info(f"✍️  [WRITER] Piszę dla {company.name} (Step {lead.step_number})...")
 
-    # --- 1. PRZYGOTOWANIE KONTEKSTU ---
-    # Definiujemy wartość domyślną NA SAMYM POCZĄTKU
-    decision_maker_name = "Zespole" 
+    # --- 1. PRZYGOTOWANIE PERSONY (DECYDENTA) ---
+    decision_maker_name = "Zespole"
+    dm_data = company.decision_makers
     
-    # Dopiero teraz sprawdzamy, czy mamy lepsze dane
-    if company.decision_makers and len(company.decision_makers) > 0:
-        # Sprawdzamy czy to string (JSON) czy lista
-        dms = company.decision_makers
-        
-        # Jeśli baza zwróciła listę (np. JSONB w Pythonie to lista)
-        if isinstance(dms, list) and len(dms) > 0:
-            raw_dm = dms[0]
-        # Jeśli to string (w starszych wersjach bazy), to pewnie JSON-string
-        elif isinstance(dms, str):
-            import json
-            try:
-                parsed = json.loads(dms)
-                if parsed and len(parsed) > 0:
-                    raw_dm = parsed[0]
-                else:
-                    raw_dm = "Zespole"
-            except:
-                raw_dm = "Zespole"
-        else:
-            raw_dm = "Zespole"
+    # Inteligentne parsowanie pola decision_makers
+    if dm_data:
+        try:
+            # Obsługa listy z SQLAlchemy (często JSONB wraca jako lista)
+            first_dm = dm_data[0] if isinstance(dm_data, list) and dm_data else str(dm_data)
+            
+            # Jeśli mamy format "Jan Kowalski (CEO)", bierzemy imię
+            if "(" in first_dm:
+                parts = first_dm.split("(")
+                full_name = parts[0].strip()
+                # Próba wyciagnięcia imienia: "Jan Kowalski" -> "Jan"
+                decision_maker_name = full_name.split(" ")[0]
+            else:
+                decision_maker_name = first_dm.split(" ")[0]
+        except Exception as e:
+            logger.warning(f"Błąd parsowania decydenta: {e}")
+            decision_maker_name = "Zespole"
 
-        # Jeśli udało się wyciągnąć stringa (np. "Jan Kowalski (CEO)")
-        if isinstance(raw_dm, str) and "(" in raw_dm:
-            decision_maker_name = raw_dm.split("(")[0].strip()
-        elif isinstance(raw_dm, str):
-            decision_maker_name = raw_dm
-
-    # --- 2. PISANIE (DRAFT 1) ---
-    # Teraz decision_maker_name ZAWSZE ma wartość (albo imię, albo "Zespole")
+    # --- 2. GENEROWANIE TREŚCI (ITERACJA 1) ---
     draft = _call_writer(
-        client, 
-        company, 
-        decision_maker_name, 
-        lead.ai_analysis_summary, 
+        client=client, 
+        company=company, 
+        decision_maker=decision_maker_name, 
+        lead_summary=lead.ai_analysis_summary, # Tu siedzi Icebreaker i Tech Stack
         step=lead.step_number
     )
     
-    # --- 3. AUDYT (HALLUCINATION KILLER) ---
-    print("   👮 AUDITOR: Sprawdzam fakty...")
-    audit = _call_auditor(draft, company)
+    # --- 3. AUDYT JAKOŚCI (SAFETY NET) ---
+    logger.info("   👮 [AUDITOR] Weryfikacja faktów...")
+    audit = _call_auditor(draft, company, client)
+    
+    final_status = "DRAFTED"
+    score = 85
     
     if not audit.passed:
-        print(f"   ⚠️ AUDIT FAIL: {audit.feedback}")
-        print("   🔄 WRITER: Poprawiam maila...")
-        # Druga próba z feedbackiem audytora
-        draft = _call_writer(client, company, decision_maker_name, lead.ai_analysis_summary, feedback=audit.feedback)
+        logger.warning(f"   ⚠️ AUDIT FAIL: {audit.feedback}. Poprawiam...")
+        # Druga próba - Writer dostaje opierdziel od Audytora
+        draft = _call_writer(
+            client, company, decision_maker_name, lead.ai_analysis_summary, 
+            step=lead.step_number, 
+            feedback=audit.feedback
+        )
         
-        # Drugi audyt (już tylko dla logów, zakładamy że poprawił)
-        audit = _call_auditor(draft, company)
-        if audit.passed:
-             print("   ✅ AUDIT PASS (po poprawce).")
-        else:
-             print("   ⚠️ AUDIT FAIL (nawet po poprawce). Zapisuję, ale oznaczam do ręcznego sprawdzenia.")
-             lead.status = "MANUAL_CHECK" # Nowy status dla trudnych przypadków
-    else:
-        print("   ✅ AUDIT PASS.")
-
-    # --- 4. ZAPIS DO BAZY ---
+        # Szybki re-audyt (dla formalności)
+        audit2 = _call_auditor(draft, company, client)
+        if not audit2.passed:
+             logger.error("   ❌ AUDIT FAIL #2. Oznaczam do ręcznej poprawki.")
+             final_status = "MANUAL_CHECK"
+             score = 30
+    
+    # --- 4. ZAPIS WYNIKU ---
     lead.generated_email_subject = draft.subject
     lead.generated_email_body = draft.body
-    lead.ai_confidence_score = 90 if audit.passed else 40
+    lead.ai_confidence_score = score
     
+    # Jeśli lead był "ANALYZED" lub "NEW", teraz staje się "DRAFTED" (gotowy do wysyłki)
     if lead.status != "MANUAL_CHECK":
-        lead.status = "DRAFTED"
+        lead.status = final_status
     
     session.commit()
-    print(f"   💾 Draft zapisany (Temat: {draft.subject})")
+    logger.info(f"   💾 Zapisano draft: '{draft.subject}'")
 
-def _call_writer(client, company, decision_maker, analysis, feedback=None, step=1):
+def _call_writer(client, company, decision_maker, lead_summary, step=1, feedback=None):
     """
-    Pomocnicza funkcja wywołująca LLM Pisarza.
-    Obsługuje różne etapy sekwencji (Step 1, Step 2, Step 3).
+    ENGINE: Silnik generujący treść.
+    Korzysta z DNA Klienta (UVP, Case Studies) i Danych Firmy (Icebreaker).
     """
-    sender_signature = client.sender_name if client.sender_name else f"Zespół {client.name}"
-
-    # --- RÓŻNE STRATEGIE DLA RÓŻNYCH KROKÓW ---
+    
+    # Wyciągamy DNA Agenta
+    sender = client.sender_name
+    uvp = client.value_proposition
+    cases = client.case_studies
+    tone = client.tone_of_voice
+    constraints = client.negative_constraints
+    
+    # Dobieramy strategię do kroku kampanii
     if step == 1:
-        # KLASYCZNY OPENER (To co mieliśmy)
-        goal_prompt = f"""
-        TO JEST PIERWSZY KONTAKT (Cold Email).
-        Cel: Zaintryguj i zachęć do rozmowy.
-        Długość: Max 120 słów.
-        Kontekst: Użyj informacji o stacku technologicznym ({company.tech_stack}).
+        strategy_prompt = f"""
+        RODZAJ: COLD EMAIL (Initial Outreach)
+        STRUKTURA: "The Bridge Model" (Icebreaker -> Problem -> Rozwiązanie -> CTA)
+        CEL: Sprzedać ROZMOWĘ, a nie produkt.
+        DŁUGOŚĆ: Krótko (max 100-120 słów). Szanuj czas CEO.
+        
+        INSTRUKCJE SPECJALNE:
+        1. **ICEBREAKER**: Musisz zacząć od odniesienia się do firmy odbiorcy (użyj danych z 'ANALIZA RESEARCHERA'). 
+           Nie pisz "Szanowni Państwo". Pisz "Cześć {decision_maker}".
+        2. **PROBLEM**: Nawiąż do ich technologii lub branży (z analizy).
+        3. **DOWÓD (Social Proof)**: Wykorzystaj to case study: "{cases[:200]}..."
+        4. **CTA**: Niskie ryzyko. Np. "Warto pogadać?", "Czy to ma sens?".
         """
     elif step == 2:
-        # FOLLOW-UP 1 (Szybkie przypomnienie)
-        goal_prompt = f"""
-        TO JEST FOLLOW-UP (Przypomnienie).
-        Wysyłamy to 3 dni po pierwszym mailu, na który nie odpisali.
-        Cel: Delikatnie przypomnij o sobie. Zapytaj, czy widzieli poprzednią wiadomość.
-        Styl: Bardzo krótki i luźny (Max 50 słów). "Cześć, podbijam temat...".
-        Nie powtarzaj całej oferty, tylko nawiąż do niej.
-        """
-    elif step == 3:
-        # BREAK-UP EMAIL (Ostatnia próba)
-        goal_prompt = f"""
-        TO JEST OSTATNIA WIADOMOŚĆ (Break-up).
-        Cel: Wywołaj "Fear Of Missing Out" albo daj im spokój.
-        Styl: "Chyba jesteście zajęci, więc nie będę męczył. Jeśli jednak temat AI Was interesuje, mój kalendarz jest otwarty."
-        Długość: Max 60 słów.
+        strategy_prompt = f"""
+        RODZAJ: FOLLOW-UP (Przypomnienie)
+        KONTEKST: Minęły 3 dni, brak odpowiedzi.
+        STRUKTURA: "Quick Bump"
+        TREŚĆ: "Cześć {decision_maker}, podbijam temat, żeby nie uciekł w gąszczu maili. Czy (krótka korzyść z UVP) jest teraz dla Was priorytetem?"
+        DŁUGOŚĆ: Ultra krótko (3-4 zdania).
         """
     else:
-        goal_prompt = "Napisz standardowy mail biznesowy."
+        strategy_prompt = """
+        RODZAJ: BREAK-UP EMAIL
+        TREŚĆ: "Chyba nie trafiłem w dobry moment. Nie będę więcej męczył. Jeśli temat wróci na tapetę - jestem tutaj."
+        CEL: Zostawić dobre wrażenie i furtkę na przyszłość.
+        """
 
-    # --- GŁÓWNY PROMPT ---
+    # --- PROMPT INŻYNIERYJNY ---
     system_prompt = f"""
-    Jesteś Copywriterem B2B. Piszesz w imieniu: {sender_signature}.
+    Jesteś światowej klasy Copywriterem B2B, specjalistą od Cold Emailingu.
+    Piszesz w imieniu: {sender} z firmy {client.name}.
     
-    ETAP KAMPANII: KROK {step}
-    {goal_prompt}
+    TWOJE DNA (OFINT):
+    - Co robimy (UVP): {uvp}
+    - Tone of Voice: {tone}
+    - Czego NIE pisać: {constraints}
     
-    ODBIORCA: {company.name} (Stack: {company.tech_stack})
-    DECYDENT: {decision_maker}
+    ODBIORCA (TARGET):
+    - Firma: {company.name}
+    - Decydent: {decision_maker}
+    - Analiza Researchera (BARDZO WAŻNE): 
+    {lead_summary}
     
-    ZASADY:
-    1. Bądź naturalny. Zero korpo-bełkotu.
-    2. PODPIS: {sender_signature}
+    ZADANIE:
+    Napisz treść maila zgodnie z poniższą strategią.
+    
+    {strategy_prompt}
+    
+    FORMATOWANIE:
+    Używaj tagów HTML: <p> dla akapitów, <b> dla kluczowych fraz (oszczędnie), <br> dla odstępów.
+    NIE dodawaj tematu w treści body. Temat ma być osobno w polu 'subject'.
     """
     
-    user_prompt = "Napisz treść maila."
+    user_message = "Napisz ten draft."
     if feedback:
-        user_prompt += f"\n\nPOPRZEDNIA WERSJA ODRZUCONA: {feedback}"
+        user_message += f"\n\n🚨 KOREKTA PO AUDYCIE: Audytor odrzucił poprzednią wersję z uwagą: '{feedback}'. Popraw to natychmiast."
 
-    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", user_prompt)])
+    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", user_message)])
     return (prompt | writer_llm).invoke({})
 
-def _call_auditor(draft, company):
-    """Pomocnicza funkcja wywołująca LLM Audytora"""
-    
+def _call_auditor(draft, company, client):
+    """
+    Strażnik Marki i Prawdy.
+    """
     system_prompt = f"""
-    Jesteś Audytorem Faktów (Hallucination Killer).
-    Twoim zadaniem jest sprawdzić, czy Copywriter nie kłamie.
+    Jesteś Audytorem Jakości (QA) w agencji marketingowej.
     
-    FAKTY O FIRMIE (Prawda):
-    - Nazwa: {company.name}
-    - Stack: {company.tech_stack}
-    - Problemy: {company.pain_points}
+    TWOJE ZADANIE:
+    Sprawdź draft maila pod kątem:
+    1. **Halucynacji**: Czy mail wspomina o technologiach, których firma {company.name} NIE używa? (Sprawdź Stack: {company.tech_stack})
+    2. **Zgodności z marką**: Czy mail narusza zakazy klienta? (Zakazy: {client.negative_constraints})
+    3. **Personalizacji**: Czy mail wygląda na masowy spam? Jeśli tak -> ODRZUĆ.
+    4. **Placeholderów**: Czy w tekście zostały nawiasy typu [Wstaw Imię]? -> ODRZUĆ.
     
-    DRAFT MAILA DO SPRAWDZENIA:
+    DRAFT:
     Temat: {draft.subject}
     Treść: {draft.body}
     
-    ZASADY AUDYTU:
-    1. Czy w mailu wymieniono technologię, której NIE MA w liście 'Stack'? (HALLUCINATION ALERT)
-    2. Czy mail obiecuje coś, co jest niemożliwe?
-    3. Czy mail jest obraźliwy?
-    
-    Jeśli wykryjesz kłamstwo -> passed=False.
+    Decyzja: True (Puszczamy) / False (Poprawka).
+    Feedback: Konkretnie co poprawić.
     """
     
-    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "Dokonaj audytu.")])
+    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "Sprawdź to.")])
     return (prompt | auditor_llm).invoke({})
