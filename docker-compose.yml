@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  # 1. BAZA DANYCH (PostgreSQL)
+  db:
+    image: postgres:15-alpine
+    container_name: agency_db
+    restart: always
+    environment:
+      POSTGRES_USER: nexus
+      POSTGRES_PASSWORD: nexus_password
+      POSTGRES_DB: agency_os
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    networks:
+      - agency_net
+
+  # 2. KOLEJKA (Redis)
+  redis:
+    image: redis:alpine
+    container_name: agency_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    networks:
+      - agency_net
+
+  # 3. GUI BAZY DANYCH (NocoDB - Twój "Airtable")
+  nocodb:
+    image: nocodb/nocodb:latest
+    container_name: agency_nocodb
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      # Łączymy NocoDB z naszą bazą Postgres
+      NC_DB: "pg://db:5432?u=nexus&p=nexus_password&d=agency_os"
+    depends_on:
+      - db
+    networks:
+      - agency_net
+
+networks:
+  agency_net:
+    driver: bridge

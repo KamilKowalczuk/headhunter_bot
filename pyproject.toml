@@ -1,0 +1,20 @@
+[project]
+name = "agent-titan-bot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dnspython>=2.8.0",
+    "firecrawl-py>=4.12.0",
+    "langchain>=1.2.0",
+    "langchain-google-genai>=4.1.2",
+    "langgraph>=1.0.5",
+    "psycopg2-binary>=2.9.11",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.2.1",
+    "redis>=7.1.0",
+    "rich>=14.2.0",
+    "sqlalchemy>=2.0.45",
+    "streamlit>=1.52.2",
+]
