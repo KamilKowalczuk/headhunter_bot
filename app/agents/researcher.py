@@ -4,6 +4,7 @@ import requests
 import json
 import logging
 import html
+import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from sqlalchemy.orm import Session
@@ -27,7 +28,8 @@ gemini_key = os.getenv("GEMINI_API_KEY")
 firecrawl_key = os.getenv("FIRECRAWL_API_KEY")
 
 if not firecrawl_key:
-    raise ValueError("❌ CRITICAL: Brak FIRECRAWL_API_KEY w .env.")
+    # Nie rzucamy błędu krytycznego przy imporcie, tylko logujemy, żeby apka nie padła
+    logger.error("❌ CRITICAL: Brak FIRECRAWL_API_KEY w .env. Researcher nie zadziała.")
 
 # Model AI
 llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.1, google_api_key=gemini_key)
@@ -69,6 +71,8 @@ class TitanScraper:
 
     def scrape(self, url):
         """Pobiera HTML (dla Regexa) i Markdown (dla AI)."""
+        if not self.api_key: return None
+        
         endpoint = f"{self.base_url}/scrape"
         payload = {
             "url": url, 
@@ -81,7 +85,6 @@ class TitanScraper:
             response = requests.post(endpoint, headers=self.headers, json=payload, timeout=30)
             if response.status_code == 200:
                 data = response.json().get('data', {})
-                # Sprawdzenie czy dostaliśmy treść
                 if not data.get('markdown') and not data.get('html'):
                     return None
                 return {
@@ -95,10 +98,12 @@ class TitanScraper:
 
     def map_site(self, url):
         """Mapuje stronę."""
+        if not self.api_key: return []
+        
         endpoint = f"{self.base_url}/map"
         payload = {"url": url, "search": "contact about team career kontakt o-nas zespol kariera"}
         try:
-            response = requests.post(endpoint, headers=self.headers, json=payload, timeout=10) # Krótki timeout na mapę
+            response = requests.post(endpoint, headers=self.headers, json=payload, timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 return data.get('links', []) or data.get('data', {}).get('links', [])
@@ -113,7 +118,6 @@ def _parallel_scrape(urls: list) -> dict:
     combined_markdown = ""
     all_html_emails = []
     
-    # Usuwamy duplikaty URLi przed startem
     urls = list(set(urls))
     
     print(f"         🚀 Uruchamiam {len(urls)} wątków scrapingowych...")
@@ -152,7 +156,6 @@ def _get_content_titan_strategy(url: str) -> str:
     """Strategia BULLDOZER: Mapowanie + Wymuszone Ścieżki."""
     print(f"      🔥 [TITAN] Cel: {url}")
     
-    # 1. Generujemy wymuszone ścieżki (Guessing)
     base_url = url.rstrip('/')
     forced_pages = [
         base_url,
@@ -162,18 +165,14 @@ def _get_content_titan_strategy(url: str) -> str:
         f"{base_url}/about"
     ]
     
-    # 2. Próbujemy mapowania (dla pewności, może znajdzie 'kariera' albo 'zespol')
     mapped_links = scraper.map_site(url)
-    
     final_list = forced_pages.copy()
     
     if mapped_links:
-        # Filtrujemy mapę pod kątem słów kluczowych, których nie zgadliśmy (np. 'zespol', 'kariera')
         keywords = ["team", "zespol", "kariera", "career", "praca"]
         interesting = [l for l in mapped_links if any(k in l.lower() for k in keywords)]
-        final_list.extend(interesting[:2]) # Max 2 dodatkowe z mapy
+        final_list.extend(interesting[:2])
 
-    # Usuwamy duplikaty i czyścimy śmieci
     clean_urls = []
     seen = set()
     for u in final_list:
@@ -182,8 +181,6 @@ def _get_content_titan_strategy(url: str) -> str:
         clean_urls.append(u)
         seen.add(u)
 
-    # Limit do 5 podstron max, żeby nie spalić tokenów, ale PRIORYTET mają KONTAKT
-    # Sortowanie: Kontakt na górę
     clean_urls.sort(key=lambda x: 0 if 'kontakt' in x or 'contact' in x else 1)
     target_urls = clean_urls[:5]
 
@@ -191,7 +188,9 @@ def _get_content_titan_strategy(url: str) -> str:
     return _parallel_scrape(target_urls)
 
 def analyze_lead(session: Session, lead_id: int):
-    """RESEARCHER V4: BULLDOZER EDITION"""
+    """
+    RESEARCHER V4: BULLDOZER EDITION (Synchroniczna Wersja Wewnętrzna).
+    """
     lead = session.query(Lead).filter(Lead.id == lead_id).first()
     if not lead: return
 
@@ -260,7 +259,7 @@ def analyze_lead(session: Session, lead_id: int):
         s = 0
         e = email.lower()
         if any(x in e for x in ['ceo', 'owner', 'founder', 'prezes']): s += 20
-        if any(x in e for x in ['biuro', 'info', 'hello', 'kontakt', 'office']): s += 15 # <-- PODBITE
+        if any(x in e for x in ['biuro', 'info', 'hello', 'kontakt', 'office']): s += 15
         if '.' in e.split('@')[0]: s += 5
         if any(x in e for x in ['kariera', 'jobs', 'rekrutacja']): s -= 20
         if not verify_email_domain(e): s -= 100
@@ -279,7 +278,7 @@ def analyze_lead(session: Session, lead_id: int):
     company.tech_stack = research.tech_stack
     company.decision_makers = research.decision_makers
     company.industry = research.target_audience
-    company.last_scraped_at = datetime.utcnow()
+    company.last_scraped_at = datetime.now() # Fix: utcnow -> now
     
     lead.ai_analysis_summary = (
         f"ICEBREAKER: {research.icebreaker}\n"
@@ -300,3 +299,12 @@ def analyze_lead(session: Session, lead_id: int):
         print(f"      ⚠️ MANUAL CHECK")
 
     session.commit()
+
+# --- NOWOŚĆ: ASYNC WRAPPER ---
+async def analyze_lead_async(session: Session, lead_id: int):
+    """
+    Asynchroniczny wrapper dla researchera.
+    Uruchamia ciężki proces scrapowania w osobnym wątku, nie blokując pętli głównej.
+    """
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, analyze_lead, session, lead_id)

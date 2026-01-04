@@ -5,11 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "apify-client>=2.3.0",
     "dnspython>=2.8.0",
     "firecrawl-py>=4.12.0",
+    "fpdf2>=2.8.5",
     "langchain>=1.2.0",
     "langchain-google-genai>=4.1.2",
     "langgraph>=1.0.5",
+    "matplotlib>=3.10.8",
     "psycopg2-binary>=2.9.11",
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.1",

@@ -49,6 +49,7 @@ class Client(Base):
     imap_server = Column(String)           # np. imap.gmail.com
     imap_port = Column(Integer, default=993)
     daily_limit = Column(Integer, default=50) # Bezpiecznik wysyłki
+    html_footer = Column(String, nullable=True) # Kod HTML stopki
 
     attachment_filename = Column(String, nullable=True)
 
@@ -127,6 +128,15 @@ class Lead(Base):
     reply_content = Column(String, nullable=True) # Treść maila od klienta
     reply_sentiment = Column(String, nullable=True) # POSITIVE, NEGATIVE, NEUTRAL
     reply_analysis = Column(String, nullable=True) # Krótka notatka AI
+
+class SearchHistory(Base):
+    __tablename__ = "search_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    query_text = Column(String, index=True) # np. "Software House Kraków"
+    client_id = Column(Integer, ForeignKey("clients.id"))
+    searched_at = Column(DateTime, default=datetime.utcnow)
+    results_found = Column(Integer, default=0)
 
 # Funkcja pomocnicza do pobierania sesji
 def get_db():
