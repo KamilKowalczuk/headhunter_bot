@@ -1,11 +1,10 @@
 import os
 import re
-import httpx  # <--- ZMIANA: httpx zamiast requests
+import httpx 
 import json
 import logging
 import html
 import asyncio
-# from concurrent.futures import ThreadPoolExecutor, as_completed # <--- USUNIĘTE (Zastąpione przez asyncio.gather)
 from datetime import datetime
 from sqlalchemy.orm import Session
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -14,7 +13,7 @@ from dotenv import load_dotenv
 
 # Importy z aplikacji
 from app.database import Lead, GlobalCompany
-from app.tools import verify_email_domain, get_main_domain_url
+from app.tools import verify_email_mx, verify_email_deep, get_main_domain_url
 from app.schemas import CompanyResearch
 
 # Konfiguracja loggera
@@ -28,14 +27,13 @@ gemini_key = os.getenv("GEMINI_API_KEY")
 firecrawl_key = os.getenv("FIRECRAWL_API_KEY")
 
 if not firecrawl_key:
-    # Nie rzucamy błędu krytycznego przy imporcie, tylko logujemy, żeby apka nie padła
     logger.error("❌ CRITICAL: Brak FIRECRAWL_API_KEY w .env. Researcher nie zadziała.")
 
 # Model AI
 llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.1, google_api_key=gemini_key)
 structured_llm = llm.with_structured_output(CompanyResearch)
 
-# --- NARZĘDZIA POMOCNICZE (SNIPER TOOLS) ---
+# --- NARZĘDZIA POMOCNICZE ---
 
 def extract_emails_from_html(raw_html: str) -> list:
     """Ekstrakcja z BRUDNEGO HTMLa (X-RAY)."""
@@ -44,11 +42,9 @@ def extract_emails_from_html(raw_html: str) -> list:
     text = html.unescape(raw_html)
     emails = []
     
-    # 1. Linki mailto (Priorytet)
     mailto_pattern = r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'
     emails.extend(re.findall(mailto_pattern, text))
     
-    # 2. Tekst
     text_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
     emails.extend(re.findall(text_pattern, text))
     
@@ -69,20 +65,18 @@ class TitanScraper:
         self.base_url = "https://api.firecrawl.dev/v1"
         self.headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    async def scrape(self, url):  # <--- ZMIANA: async def
-        """Pobiera HTML (dla Regexa) i Markdown (dla AI)."""
+    async def scrape(self, url): 
         if not self.api_key: return None
         
         endpoint = f"{self.base_url}/scrape"
         payload = {
             "url": url, 
             "formats": ["markdown", "html"], 
-            "onlyMainContent": False, # WAŻNE: Pobieramy stopki!
+            "onlyMainContent": False, 
             "timeout": 20000,
             "excludeTags": ["script", "style", "video", "canvas"] 
         }
         
-        # Używamy httpx.AsyncClient dla nieblokujących zapytań
         async with httpx.AsyncClient(timeout=30.0) as client:
             try:
                 response = await client.post(endpoint, headers=self.headers, json=payload)
@@ -94,13 +88,15 @@ class TitanScraper:
                         "markdown": data.get('markdown', ""),
                         "html": data.get('html', "")
                     }
+                elif response.status_code == 429:
+                    logger.warning(f"⚠️ RATE LIMIT (429) dla {url}. Zwalniam...")
+                    return None
                 return None
             except Exception as e:
                 logger.error(f"Błąd scrapowania {url}: {e}")
                 return None
 
-    async def map_site(self, url): # <--- ZMIANA: async def
-        """Mapuje stronę."""
+    async def map_site(self, url): 
         if not self.api_key: return []
         
         endpoint = f"{self.base_url}/map"
@@ -118,17 +114,21 @@ class TitanScraper:
 
 scraper = TitanScraper(firecrawl_key)
 
-async def _parallel_scrape(urls: list) -> dict: # <--- ZMIANA: async def
-    """Wielowątkowe pobieranie (Async Gather)."""
+async def _parallel_scrape(urls: list) -> dict: 
     combined_markdown = ""
     all_html_emails = []
     
     urls = list(set(urls))
     
-    print(f"         🚀 Uruchamiam {len(urls)} zadań async scrapingowych...")
+    print(f"         🚀 Uruchamiam {len(urls)} zadań async scrapingowych (z opóźnieniem)...")
     
-    # Zastępujemy ThreadPoolExecutor przez asyncio.gather (prawdziwa równoległość IO)
-    tasks = [scraper.scrape(url) for url in urls]
+    tasks = []
+    for url in urls:
+        # Dodajemy opóźnienie między dodaniem zadań, żeby nie uderzyć w 5 endpointów w 1ms
+        # To pomaga ominąć proste WAF-y i Rate Limity
+        tasks.append(scraper.scrape(url))
+        await asyncio.sleep(0.5) # <--- RATE LIMIT FIX (500ms delay)
+
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
     for i, result in enumerate(results):
@@ -139,14 +139,12 @@ async def _parallel_scrape(urls: list) -> dict: # <--- ZMIANA: async def
             continue
             
         if result:
-            # 1. Regex z HTML
             if result.get("html"):
                 found = extract_emails_from_html(result["html"])
                 if found:
                     print(f"            👀 Znaleziono w HTML ({url}): {found}")
                     all_html_emails.extend(found)
             
-            # 2. Markdown dla AI
             md = result.get("markdown", "")
             if len(md) > 50:
                 section_name = "STRONA"
@@ -160,7 +158,7 @@ async def _parallel_scrape(urls: list) -> dict: # <--- ZMIANA: async def
         "regex_emails": list(set(all_html_emails))
     }
 
-async def _get_content_titan_strategy(url: str) -> dict: # <--- ZMIANA: async def
+async def _get_content_titan_strategy(url: str) -> dict: 
     """Strategia BULLDOZER: Mapowanie + Wymuszone Ścieżki (Async)."""
     print(f"      🔥 [TITAN] Cel: {url}")
     
@@ -173,7 +171,6 @@ async def _get_content_titan_strategy(url: str) -> dict: # <--- ZMIANA: async de
         f"{base_url}/about"
     ]
     
-    # Async Mapowanie
     mapped_links = await scraper.map_site(url)
     final_list = forced_pages.copy()
     
@@ -194,28 +191,25 @@ async def _get_content_titan_strategy(url: str) -> dict: # <--- ZMIANA: async de
     target_urls = clean_urls[:5]
 
     print(f"         🎯 Lista celów: {[u.split('/')[-1] for u in target_urls]}")
-    # Async Scraping
     return await _parallel_scrape(target_urls)
 
 def analyze_lead(session: Session, lead_id: int):
     """
-    RESEARCHER V4: BULLDOZER EDITION (Wrapper Synchroniczny).
-    Uruchamia asynchroniczny scraping wewnątrz synchronicznej funkcji.
+    RESEARCHER V4: BULLDOZER + DEBOUNCE VERIFIER.
     """
     lead = session.query(Lead).filter(Lead.id == lead_id).first()
     if not lead: return
 
     company = lead.company
-    client = lead.campaign.client # Pobieramy klienta żeby sprawdzić tryb
-    mode = getattr(client, "mode", "SALES") # SALES lub JOB_HUNT
+    client = lead.campaign.client
+    mode = getattr(client, "mode", "SALES") 
 
     print(f"\n   🔎 [RESEARCHER {mode}] Analiza: {company.name}")
     
     target_url = get_main_domain_url(company.domain)
     if not target_url.startswith("http"): target_url = "https://" + target_url
 
-    # 1. POBIERANIE (Bulldozer Strategy - RUN ASYNC IN SYNC CONTEXT)
-    # Używamy asyncio.run, aby odpalić szybki event loop dla httpx wewnątrz wątku roboczego
+    # 1. POBIERANIE (Async in Sync)
     try:
         scan_result = asyncio.run(_get_content_titan_strategy(target_url))
     except Exception as e:
@@ -226,12 +220,12 @@ def analyze_lead(session: Session, lead_id: int):
     regex_emails = scan_result["regex_emails"]
 
     if not content_md and not regex_emails:
-        print(f"      ❌ PUSTY ZWIAD. Próba 404 na wszystkich podstronach.")
+        print(f"      ❌ PUSTY ZWIAD. Próba 404.")
         lead.status = "MANUAL_CHECK"
         session.commit()
         return
 
-    # 2. ANALIZA AI (Zależna od TRYBU)
+    # 2. ANALIZA AI
     print(f"      🧠 Gemini analizuje dane...")
     
     regex_hint = ""
@@ -242,33 +236,23 @@ def analyze_lead(session: Session, lead_id: int):
         )
 
     if mode == "JOB_HUNT":
-        # --- PROMPT REKRUTACYJNY ---
         system_prompt = f"""
-        Jesteś Analitykiem Rynku Pracy IT. Twoim zadaniem jest ocenić firmę jako potencjalnego PRACODAWCĘ.
+        Jesteś Analitykiem Rynku Pracy IT.
         Analizujesz surową treść ze strony WWW.
-        
         ZADANIA PRIORYTETOWE:
-        1. **E-MAIL:** {regex_hint} Szukaj maili do HR, Rekrutacji (kariera@, jobs@, rekrutacja@) LUB do CTO/Team Leaderów.
-        2. **TECH STACK:** Jakie technologie widać w ogłoszeniach o pracę lub opisach projektów? (np. Python, AWS, React).
-        3. **HIRING:** Czy mają zakładkę "Kariera"? Czy szukają ludzi? (Nawet jeśli nie ma Twojego stanowiska).
-        4. **DECYDENT:** Szukaj imion: CTO, Head of Engineering, HR Manager, Founder.
-        
-        CELE:
-        - Znajdź punkty zaczepienia do listu motywacyjnego ("Widzę, że używacie X").
-        - Wyłap kulturę firmy (Remote/Hybrid?).
+        1. **E-MAIL:** {regex_hint} Szukaj maili do HR, Rekrutacji (kariera@, jobs@) LUB do CTO/Team Leaderów.
+        2. **TECH STACK:** (np. Python, AWS, React).
+        3. **HIRING:** Czy mają zakładkę "Kariera"?
+        4. **DECYDENT:** Szukaj imion: CTO, HR Manager, Founder.
         """
     else:
-        # --- PROMPT SPRZEDAŻOWY (STANDARD) ---
         system_prompt = f"""
-        Jesteś analitykiem B2B. Analizujesz surową treść HTML/Markdown z kilku podstron firmy.
-        
+        Jesteś analitykiem B2B. Analizujesz treść ze strony WWW.
         ZADANIE:
         1. **E-MAIL:** {regex_hint} Szukaj w sekcjach "Kontakt", "Stopka".
-        2. Stack Tech & Hiring (Jako sygnał rozwoju).
-        3. Icebreaker (Punkt zaczepienia do sprzedaży).
-        
-        Priorytety maili: Imienne > Biuro/Kontakt/Hello > Sprzedaż.
-        Ignoruj: przykładowe domeny, webmasterów, grafikę.
+        2. Stack Tech & Hiring (Sygnał rozwoju).
+        3. Icebreaker (Punkt zaczepienia).
+        Priorytety maili: Imienne > Biuro/Kontakt > Sprzedaż.
         """
     
     try:
@@ -276,49 +260,76 @@ def analyze_lead(session: Session, lead_id: int):
         research = chain.invoke({"text": content_md[:70000]})
     except Exception as e:
         print(f"      ❌ Błąd LLM: {e}")
+        # Ratunek HTML w przypadku błędu LLM
         if regex_emails:
             print("      ⚠️ LLM Error. Ratuję lead mailami z HTML.")
-            lead.target_email = regex_emails[0]
-            lead.status = "ANALYZED"
-            lead.ai_confidence_score = 50
-            lead.ai_analysis_summary = "HTML RESCUE MODE. LLM FAILED."
+            # Sprawdzamy pierwszy mail w trybie awaryjnym
+            status = verify_email_deep(regex_emails[0])
+            if status == "INVALID":
+                lead.status = "MANUAL_CHECK"
+                print("      💀 Email z HTML jest INVALID.")
+            else:
+                lead.target_email = regex_emails[0]
+                lead.status = "ANALYZED"
+                lead.ai_confidence_score = 40
+                lead.ai_analysis_summary = f"HTML RESCUE MODE. Status: {status}"
             session.commit()
             return
         lead.status = "MANUAL_CHECK"
         session.commit()
         return
 
-    # 3. MERGE & SCORE (Zależne od trybu)
+    # 3. SCORING & SELECTION
     combined_emails = list(set((research.contact_emails or []) + regex_emails))
     
     def score_email(email):
         s = 0
         e = email.lower()
         if mode == "JOB_HUNT":
-            # W trybie pracy: HR i Kariera są OK, ale CTO/Founder lepsi
             if any(x in e for x in ['kariera', 'jobs', 'rekrutacja', 'hr', 'people']): s += 20
             if any(x in e for x in ['cto', 'tech', 'engineering']): s += 25
             if any(x in e for x in ['ceo', 'founder']): s += 15
         else:
-            # W trybie sprzedaży: Kariera to śmietnik
             if any(x in e for x in ['ceo', 'owner', 'founder', 'prezes']): s += 20
-            if any(x in e for x in ['kariera', 'jobs', 'rekrutacja']): s -= 20 # Kara za HR w sprzedaży
+            if any(x in e for x in ['kariera', 'jobs', 'rekrutacja']): s -= 20 
             
         if any(x in e for x in ['biuro', 'info', 'hello', 'kontakt', 'office']): s += 15
         if '.' in e.split('@')[0]: s += 5
-        if not verify_email_domain(e): s -= 100
+        # Tu używamy tylko darmowego MX check do sortowania (nie płacimy jeszcze)
+        if not verify_email_mx(e): s -= 100 
         return s
 
-    valid_email = None
+    scored = []
     if combined_emails:
         scored = sorted([(e, score_email(e)) for e in combined_emails], key=lambda x: x[1], reverse=True)
         print(f"      📧 Scoring [{mode}]: {scored}")
-        
-        best_email, score = scored[0]
-        if score > -20:
-            valid_email = best_email
 
-    # 4. ZAPIS
+    # 4. DEEP VERIFICATION (DeBounce Loop)
+    
+    final_email = None
+    verification_note = ""
+    
+    for candidate, score in scored:
+        if score < -20: continue # Szkoda kasy na śmieci
+        
+        print(f"      🛡️ Weryfikacja DeBounce dla: {candidate}...")
+        status = verify_email_deep(candidate)
+        
+        if status in ["OK", "RISKY"]:
+            final_email = candidate
+            verification_note = f"[VERIFIED: {status}]"
+            if status == "OK":
+                print("         ✅ Adres POPRAWNY.")
+            else:
+                print("         ⚠️ Adres RYZYKOWNY (Catch-All/Role), ale akceptowalny.")
+            break # Mamy zwycięzcę
+        else:
+            print(f"         ❌ Adres INVALID/SPAMTRAP. Próbuję następny...")
+
+    if not final_email and scored:
+        verification_note = "All emails failed verification."
+
+    # 5. ZAPIS
     company.tech_stack = research.tech_stack
     company.decision_makers = research.decision_makers
     company.industry = research.target_audience
@@ -328,29 +339,25 @@ def analyze_lead(session: Session, lead_id: int):
         f"MODE: {mode}\n"
         f"ICEBREAKER: {research.icebreaker}\n"
         f"SUMMARY: {research.summary}\n"
-        f"MAILS: {combined_emails}\n"
+        f"MAILS FOUND: {combined_emails}\n"
         f"HIRING: {research.hiring_signals}\n"
-        f"PAIN: {research.pain_points_or_opportunities}"
+        f"VERIFICATION: {verification_note}"
     )
     
-    if valid_email:
-        lead.target_email = valid_email
+    if final_email:
+        lead.target_email = final_email
         lead.status = "ANALYZED"
-        lead.ai_confidence_score = 95
-        print(f"      ✅ SUKCES: {valid_email}")
+        # Dajemy wysoki score tylko jeśli weryfikacja była OK, niższy przy Catch-All
+        lead.ai_confidence_score = 95 if "OK" in verification_note else 65
+        print(f"      ✅ SUKCES: {final_email} {verification_note}")
     else:
         lead.status = "MANUAL_CHECK"
         lead.ai_confidence_score = 15
-        print(f"      ⚠️ MANUAL CHECK")
+        print(f"      ⚠️ MANUAL CHECK (Brak poprawnego maila)")
 
     session.commit()
 
-# --- ASYNC WRAPPER DLA PĘTLI GŁÓWNEJ ---
+# --- ASYNC WRAPPER ---
 async def analyze_lead_async(session: Session, lead_id: int):
-    """
-    Asynchroniczny wrapper dla researchera.
-    Uruchamia ciężki proces scrapowania w osobnym wątku (przez analyze_lead),
-    a wewnątrz wątku odpala się mini-loop AsyncIO dla httpx.
-    """
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, analyze_lead, session, lead_id)
