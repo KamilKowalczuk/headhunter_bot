@@ -1,355 +1,400 @@
 import os
-import re
-import httpx 
-import json
-import logging
-import html
 import asyncio
-from datetime import datetime
+import logging
+from typing import List, Dict, Any, Set, Optional
+from urllib.parse import urlparse
+from apify_client import ApifyClientAsync
 from sqlalchemy.orm import Session
+from sqlalchemy import select, and_, desc, text
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+
+# AI Imports
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
-from dotenv import load_dotenv
 
-# Importy z aplikacji
-from app.database import Lead, GlobalCompany
-from app.tools import verify_email_mx, verify_email_deep, get_main_domain_url
-from app.schemas import CompanyResearch
+# Importy aplikacji
+from app.database import GlobalCompany, Lead, SearchHistory, Campaign, Client
+from app.schemas import StrategyOutput
 
-# Konfiguracja loggera
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("researcher")
-
+# --- KONFIGURACJA ENTERPRISE ---
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("scout")
+APIFY_TOKEN = os.getenv("APIFY_API_TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
-# Konfiguracja API
-gemini_key = os.getenv("GEMINI_API_KEY")
-firecrawl_key = os.getenv("FIRECRAWL_API_KEY")
+# === BEZPIECZNIKI (FUSES) ===
+BATCH_SIZE = 40             
+SAFETY_LIMIT_LEADS = 20     
+SAFETY_LIMIT_QUERIES = 2    
+DUPLICATE_COOLDOWN_DAYS = 30 
+GLOBAL_CONTACT_COOLDOWN = 30 
 
-if not firecrawl_key:
-    logger.error("❌ CRITICAL: Brak FIRECRAWL_API_KEY w .env. Researcher nie zadziała.")
+# DOSTĘPNE ŹRÓDŁA DANYCH (Actors)
+ACTOR_MAPS = "compass/crawler-google-places"
+ACTOR_SEARCH = "apify/google-search-scraper" 
 
-# Model AI
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.1, google_api_key=gemini_key)
-structured_llm = llm.with_structured_output(CompanyResearch)
+# Inicjalizacja AI (Gatekeeper)
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.0-flash", 
+    temperature=0.0, # Zero kreatywności, czysta logika
+    google_api_key=GEMINI_KEY
+)
 
-# --- NARZĘDZIA POMOCNICZE ---
+if not APIFY_TOKEN:
+    logger.error("❌ CRITICAL: Brak APIFY_API_TOKEN. Scout jest martwy.")
+    client = None
+else:
+    client = ApifyClientAsync(APIFY_TOKEN)
 
-def extract_emails_from_html(raw_html: str) -> list:
-    """Ekstrakcja z BRUDNEGO HTMLa (X-RAY)."""
-    if not raw_html: return []
-    
-    text = html.unescape(raw_html)
-    emails = []
-    
-    mailto_pattern = r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'
-    emails.extend(re.findall(mailto_pattern, text))
-    
-    text_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-    emails.extend(re.findall(text_pattern, text))
-    
-    unique = list(set(e.lower() for e in emails))
-    clean = []
-    for email in unique:
-        if email.endswith(('.png', '.jpg', '.jpeg', '.gif', '.css', '.js', '.svg', '.woff', '.webp', '.mp4')): continue
-        if any(x in email for x in ['sentry', 'noreply', 'no-reply', 'example', 'domain', 'email.com', 'bootstrap', 'react']): continue
-        if len(email) < 5 or len(email) > 60: continue
-        clean.append(email)
+# --- MODEL DANYCH DLA AI GATEKEEPERA ---
+class ValidatedDomain(BaseModel):
+    domain: str = Field(..., description="Czysta domena, np. 'softwarehouse.com'")
+    reason: str = Field(..., description="Krótkie uzasadnienie dlaczego pasuje do ICP")
+
+class BatchValidationResult(BaseModel):
+    valid_domains: List[ValidatedDomain] = Field(default_factory=list)
+
+# --- LOGIKA BIZNESOWA ---
+
+def _clean_domain(website_url: str) -> str | None:
+    """Enterprise-grade domain sanitizer."""
+    if not website_url: return None
+    try:
+        parsed = urlparse(website_url)
+        domain = parsed.netloc or parsed.path 
+        domain = domain.replace("www.", "").lower().strip()
         
-    return clean
+        if "/" in domain: domain = domain.split("/")[0]
 
-class TitanScraper:
-    """Klient Firecrawl - Tryb Async (HTTPX)."""
-    def __init__(self, api_key):
-        self.api_key = api_key
-        self.base_url = "https://api.firecrawl.dev/v1"
-        self.headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        blacklist = [
+            "facebook.com", "instagram.com", "linkedin.com", "google.com", "youtube.com", "twitter.com", 
+            "booksy.com", "znanylekarz.pl", "yelp.com", "researchgate.net", "wikipedia.org", "medium.com",
+            "glassdoor.com", "indeed.com", "pracuj.pl", "nofluffjobs.com", "justjoin.it", "scholar.google.ca", 
+            "scholar.google.com", "amazon.com", "allegro.pl", "olx.pl", "otomoto.pl", "booking.com", "tripadvisor.com",
+            "f6s.com", "clutch.co", "goodfirms.co"
+        ]
+        
+        if domain.endswith(".gov") or domain.endswith(".edu"): return None
+        if domain in blacklist: return None
+        if "." not in domain: return None
 
-    async def scrape(self, url): 
-        if not self.api_key: return None
-        
-        endpoint = f"{self.base_url}/scrape"
-        payload = {
-            "url": url, 
-            "formats": ["markdown", "html"], 
-            "onlyMainContent": False, 
-            "timeout": 20000,
-            "excludeTags": ["script", "style", "video", "canvas"] 
-        }
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            try:
-                response = await client.post(endpoint, headers=self.headers, json=payload)
-                if response.status_code == 200:
-                    data = response.json().get('data', {})
-                    if not data.get('markdown') and not data.get('html'):
-                        return None
-                    return {
-                        "markdown": data.get('markdown', ""),
-                        "html": data.get('html', "")
-                    }
-                return None
-            except Exception as e:
-                logger.error(f"Błąd scrapowania {url}: {e}")
-                return None
+        return domain
+    except Exception:
+        return None
 
-    async def map_site(self, url): 
-        if not self.api_key: return []
-        
-        endpoint = f"{self.base_url}/map"
-        payload = {"url": url, "search": "contact about team career kontakt o-nas zespol kariera"}
-        
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            try:
-                response = await client.post(endpoint, headers=self.headers, json=payload)
-                if response.status_code == 200:
-                    data = response.json()
-                    return data.get('links', []) or data.get('data', {}).get('links', [])
-                return []
-            except:
-                return []
-
-scraper = TitanScraper(firecrawl_key)
-
-async def _parallel_scrape(urls: list) -> dict: 
-    combined_markdown = ""
-    all_html_emails = []
-    
-    urls = list(set(urls))
-    
-    print(f"         🚀 Uruchamiam {len(urls)} zadań async scrapingowych...")
-    
-    tasks = [scraper.scrape(url) for url in urls]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    for i, result in enumerate(results):
-        url = urls[i]
-        
-        if isinstance(result, Exception):
-            logger.error(f"Błąd zadania {url}: {result}")
-            continue
-            
-        if result:
-            if result.get("html"):
-                found = extract_emails_from_html(result["html"])
-                if found:
-                    print(f"            👀 Znaleziono w HTML ({url}): {found}")
-                    all_html_emails.extend(found)
-            
-            md = result.get("markdown", "")
-            if len(md) > 50:
-                section_name = "STRONA"
-                if "contact" in url or "kontakt" in url: section_name = "KONTAKT"
-                elif "about" in url or "o-nas" in url: section_name = "O NAS"
-                
-                combined_markdown += f"\n\n=== {section_name} ({url}) ===\n{md[:15000]}"
-                
+def _get_client_icp(session: Session, campaign_id: int) -> dict:
+    """Pobiera dane klienta potrzebne do filtracji AI."""
+    campaign = session.query(Campaign).filter(Campaign.id == campaign_id).first()
+    if not campaign or not campaign.client:
+        return {"icp": "General Business", "industry": "B2B"}
     return {
-        "markdown": combined_markdown,
-        "regex_emails": list(set(all_html_emails))
+        "icp": campaign.client.ideal_customer_profile,
+        "industry": campaign.client.industry,
+        "mode": getattr(campaign.client, "mode", "SALES")
     }
 
-async def _get_content_titan_strategy(url: str) -> dict: 
-    """Strategia BULLDOZER: Mapowanie + Wymuszone Ścieżki (Async)."""
-    print(f"      🔥 [TITAN] Cel: {url}")
-    
-    base_url = url.rstrip('/')
-    forced_pages = [
-        base_url,
-        f"{base_url}/kontakt",
-        f"{base_url}/contact",
-        f"{base_url}/o-nas",
-        f"{base_url}/about"
-    ]
-    
-    mapped_links = await scraper.map_site(url)
-    final_list = forced_pages.copy()
-    
-    if mapped_links:
-        keywords = ["team", "zespol", "kariera", "career", "praca"]
-        interesting = [l for l in mapped_links if any(k in l.lower() for k in keywords)]
-        final_list.extend(interesting[:2])
-
-    clean_urls = []
-    seen = set()
-    for u in final_list:
-        if u in seen: continue
-        if any(ext in u.lower() for ext in ['.pdf', '.jpg', '.png', '#']): continue
-        clean_urls.append(u)
-        seen.add(u)
-
-    clean_urls.sort(key=lambda x: 0 if 'kontakt' in x or 'contact' in x else 1)
-    target_urls = clean_urls[:5]
-
-    print(f"         🎯 Lista celów: {[u.split('/')[-1] for u in target_urls]}")
-    return await _parallel_scrape(target_urls)
-
-def analyze_lead(session: Session, lead_id: int):
+async def _ai_filter_batch(raw_items: List[Dict], client_data: Dict) -> List[str]:
     """
-    RESEARCHER V4: BULLDOZER + DEBOUNCE VERIFIER.
+    PROTOCOL: GARBAGE COLLECTOR.
+    Gemini 2.0 Flash analizuje listę 40 surowych wyników i odrzuca śmieci (B2C, pomyłki map, konkurencję).
     """
-    lead = session.query(Lead).filter(Lead.id == lead_id).first()
-    if not lead: return
-
-    company = lead.company
-    client = lead.campaign.client
-    mode = getattr(client, "mode", "SALES") 
-
-    print(f"\n   🔎 [RESEARCHER {mode}] Analiza: {company.name}")
+    candidates = []
+    for item in raw_items:
+        url = item.get("website") or item.get("url")
+        clean = _clean_domain(url)
+        if clean:
+            name = item.get("title") or item.get("title", "Unknown")
+            category = item.get("categoryName") or "Web Search"
+            candidates.append(f"- URL: {clean} | NAME: {name} | CATEGORY: {category}")
     
-    target_url = get_main_domain_url(company.domain)
-    if not target_url.startswith("http"): target_url = "https://" + target_url
+    if not candidates: return []
 
-    # 1. POBIERANIE (Async in Sync)
+    candidates_str = "\n".join(candidates[:50]) # Limit promptu
+    
+    system_prompt = """
+    Jesteś Gatekeeperem bazy danych B2B. Twoim zadaniem jest filtracja surowych wyników ze scrapingu.
+    
+    KLIENT (Dla kogo szukamy):
+    - Branża: {industry}
+    - Kogo szuka (ICP): {icp}
+    - Tryb: {mode} (SALES = szuka klientów, JOB_HUNT = szuka pracodawców)
+    
+    ZASADY FILTRACJI (PROTOCOL 0/1):
+    1. ODRZUCAJ pomyłki kategorii (np. szukamy "Software House", a wynik to "Sklep z grami").
+    2. ODRZUCAJ gigantów i portale (Facebook, Amazon, Allegro) jeśli jakimś cudem przeszły.
+    3. ODRZUCAJ instytucje publiczne (Urząd, Szkoła) chyba że ICP mówi inaczej.
+    4. Jeśli Tryb to SALES: ODRZUCAJ konkurencję klienta (chyba że szukamy partnerów).
+    
+    LISTA KANDYDATÓW:
+    {candidates}
+    
+    Zwróć listę TYLKO pasujących domen w formacie JSON.
+    """
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "Dokonaj selekcji.")
+    ])
+
+    # Używamy structured output dla bezpieczeństwa typów
+    gatekeeper = prompt | llm.with_structured_output(BatchValidationResult)
+
     try:
-        scan_result = asyncio.run(_get_content_titan_strategy(target_url))
+        print(f"      🤖 [AI GATEKEEPER] Analizuję {len(candidates)} kandydatów...")
+        result = await gatekeeper.ainvoke({
+            "industry": client_data["industry"],
+            "icp": client_data["icp"],
+            "mode": client_data["mode"],
+            "candidates": candidates_str
+        })
+        
+        valid_domains = [v.domain for v in result.valid_domains]
+        print(f"      ✅ [AI GATEKEEPER] Przepuszczono: {len(valid_domains)}/{len(candidates)}")
+        return valid_domains
+
     except Exception as e:
-        logger.error(f"      ❌ Błąd Async Loop w Research: {e}")
-        scan_result = {"markdown": "", "regex_emails": []}
-    
-    content_md = scan_result["markdown"]
-    regex_emails = scan_result["regex_emails"]
+        logger.error(f"AI Filter Error: {e}")
+        # Fail-open: w razie błędu AI zwracamy wszystkie technicznie poprawne domeny, żeby nie zatrzymać procesu
+        return [c.split("|")[0].replace("- URL:", "").strip() for c in candidates]
 
-    if not content_md and not regex_emails:
-        print(f"      ❌ PUSTY ZWIAD. Próba 404.")
-        lead.status = "MANUAL_CHECK"
-        session.commit()
-        return
+# --- FUNKCJE BAZODANOWE (Wrapper) ---
 
-    # 2. ANALIZA AI
-    print(f"      🧠 Gemini analizuje dane...")
+def _db_get_valid_queries(session: Session, campaign_id: int, raw_queries: List[str]) -> tuple[List[str], int]:
+    campaign_obj = session.query(Campaign).filter(Campaign.id == campaign_id).first()
+    client_id = campaign_obj.client_id if campaign_obj else None
     
-    regex_hint = ""
-    if regex_emails:
-        regex_hint = (
-            f"ZNALAZŁEM NASTĘPUJĄCE MAILE W KODZIE HTML (TO SĄ FAKTY): {', '.join(regex_emails)}. "
-            f"DODAJ JE DO LISTY contact_emails."
-        )
+    valid_queries = []
+    print(f"\n🧠 [SCOUT MEMORY] Analizuję {len(raw_queries)} propozycji strategii...")
 
-    if mode == "JOB_HUNT":
-        system_prompt = f"""
-        Jesteś Analitykiem Rynku Pracy IT.
-        Analizujesz surową treść ze strony WWW.
-        ZADANIA PRIORYTETOWE:
-        1. **E-MAIL:** {regex_hint} Szukaj maili do HR, Rekrutacji (kariera@, jobs@) LUB do CTO/Team Leaderów.
-        2. **TECH STACK:** (np. Python, AWS, React).
-        3. **HIRING:** Czy mają zakładkę "Kariera"?
-        4. **DECYDENT:** Szukaj imion: CTO, HR Manager, Founder.
-        """
-    else:
-        system_prompt = f"""
-        Jesteś analitykiem B2B. Analizujesz treść ze strony WWW.
-        ZADANIE:
-        1. **E-MAIL:** {regex_hint} Szukaj w sekcjach "Kontakt", "Stopka".
-        2. Stack Tech & Hiring (Sygnał rozwoju).
-        3. Icebreaker (Punkt zaczepienia).
-        Priorytety maili: Imienne > Biuro/Kontakt > Sprzedaż.
-        """
-    
-    try:
-        chain = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{text}")]).pipe(structured_llm)
-        research = chain.invoke({"text": content_md[:70000]})
-    except Exception as e:
-        print(f"      ❌ Błąd LLM: {e}")
-        # Ratunek HTML w przypadku błędu LLM
-        if regex_emails:
-            print("      ⚠️ LLM Error. Ratuję lead mailami z HTML.")
-            # Sprawdzamy pierwszy mail w trybie awaryjnym
-            status = verify_email_deep(regex_emails[0])
-            if status == "INVALID":
-                lead.status = "MANUAL_CHECK"
-                print("      💀 Email z HTML jest INVALID.")
-            else:
-                lead.target_email = regex_emails[0]
-                lead.status = "ANALYZED"
-                lead.ai_confidence_score = 40
-                lead.ai_analysis_summary = f"HTML RESCUE MODE. Status: {status}"
-            session.commit()
-            return
-        lead.status = "MANUAL_CHECK"
-        session.commit()
-        return
+    for q in raw_queries:
+        last_search = session.query(SearchHistory).filter(
+            SearchHistory.client_id == client_id,
+            SearchHistory.query_text == q,
+            SearchHistory.searched_at > datetime.now() - timedelta(days=DUPLICATE_COOLDOWN_DAYS)
+        ).first()
 
-    # 3. SCORING & SELECTION
-    combined_emails = list(set((research.contact_emails or []) + regex_emails))
-    
-    def score_email(email):
-        s = 0
-        e = email.lower()
-        if mode == "JOB_HUNT":
-            if any(x in e for x in ['kariera', 'jobs', 'rekrutacja', 'hr', 'people']): s += 20
-            if any(x in e for x in ['cto', 'tech', 'engineering']): s += 25
-            if any(x in e for x in ['ceo', 'founder']): s += 15
+        if last_search:
+            print(f"   🚫 POMIJAM: '{q}' (Szukano: {last_search.searched_at.strftime('%Y-%m-%d')})")
         else:
-            if any(x in e for x in ['ceo', 'owner', 'founder', 'prezes']): s += 20
-            if any(x in e for x in ['kariera', 'jobs', 'rekrutacja']): s -= 20 
+            valid_queries.append(q)
             
-        if any(x in e for x in ['biuro', 'info', 'hello', 'kontakt', 'office']): s += 15
-        if '.' in e.split('@')[0]: s += 5
-        # Tu używamy tylko darmowego MX check do sortowania (nie płacimy jeszcze)
-        if not verify_email_mx(e): s -= 100 
-        return s
+    return valid_queries[:SAFETY_LIMIT_QUERIES], client_id
 
-    scored = []
-    if combined_emails:
-        scored = sorted([(e, score_email(e)) for e in combined_emails], key=lambda x: x[1], reverse=True)
-        print(f"      📧 Scoring [{mode}]: {scored}")
+def _db_create_history_entry(session: Session, client_id: int, query: str) -> int:
+    if not client_id: return None
+    entry = SearchHistory(query_text=query, client_id=client_id, results_found=0)
+    session.add(entry)
+    session.commit()
+    return entry.id
 
-    # 4. DEEP VERIFICATION (DeBounce Loop)
-    # Sprawdzamy maile po kolei od najlepszego, aż trafimy na poprawny.
-    
-    final_email = None
-    verification_note = ""
-    
-    for candidate, score in scored:
-        if score < -20: continue # Szkoda kasy na śmieci
-        
-        print(f"      🛡️ Weryfikacja DeBounce dla: {candidate}...")
-        status = verify_email_deep(candidate)
-        
-        if status in ["OK", "RISKY"]:
-            final_email = candidate
-            verification_note = f"[VERIFIED: {status}]"
-            if status == "OK":
-                print("         ✅ Adres POPRAWNY.")
-            else:
-                print("         ⚠️ Adres RYZYKOWNY (Catch-All/Role), ale akceptowalny.")
-            break # Mamy zwycięzcę, przerywamy pętlę (nie płacimy za resztę)
-        else:
-            print(f"         ❌ Adres INVALID/SPAMTRAP. Próbuję następny...")
-
-    if not final_email and scored:
-        verification_note = "All emails failed verification."
-
-    # 5. ZAPIS
-    company.tech_stack = research.tech_stack
-    company.decision_makers = research.decision_makers
-    company.industry = research.target_audience
-    company.last_scraped_at = datetime.now()
-    
-    lead.ai_analysis_summary = (
-        f"MODE: {mode}\n"
-        f"ICEBREAKER: {research.icebreaker}\n"
-        f"SUMMARY: {research.summary}\n"
-        f"MAILS FOUND: {combined_emails}\n"
-        f"HIRING: {research.hiring_signals}\n"
-        f"VERIFICATION: {verification_note}"
-    )
-    
-    if final_email:
-        lead.target_email = final_email
-        lead.status = "ANALYZED"
-        # Dajemy wysoki score tylko jeśli weryfikacja była OK, niższy przy Catch-All
-        lead.ai_confidence_score = 95 if "OK" in verification_note else 65
-        print(f"      ✅ SUKCES: {final_email} {verification_note}")
-    else:
-        lead.status = "MANUAL_CHECK"
-        lead.ai_confidence_score = 15
-        print(f"      ⚠️ MANUAL CHECK (Brak poprawnego maila)")
-
+def _db_update_history_results(session: Session, entry_id: int, count: int):
+    if not entry_id: return
+    session.query(SearchHistory).filter(SearchHistory.id == entry_id).update({"results_found": count})
     session.commit()
 
-# --- ASYNC WRAPPER ---
-async def analyze_lead_async(session: Session, lead_id: int):
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, analyze_lead, session, lead_id)
+def _db_process_scraped_items(session: Session, campaign_id: int, items: List[Dict], query: str, approved_domains: List[str]) -> int:
+    """
+    Wersja v2: Przyjmuje listę approved_domains z AI.
+    """
+    added_count = 0
+    
+    # 1. Filtrowanie po liście od AI
+    # approved_domains są już po _clean_domain w funkcji AI, ale dla pewności:
+    clean_approved = set(d.lower().strip() for d in approved_domains)
+    
+    if not clean_approved:
+        return 0
+
+    # 2. Pobranie istniejących firm (Cache Bazy)
+    existing_companies = session.query(GlobalCompany).filter(GlobalCompany.domain.in_(list(clean_approved))).all()
+    existing_domains_map = {c.domain: c for c in existing_companies}
+    
+    new_companies_to_add = []
+    
+    # Mapowanie itemów na obiekty GlobalCompany
+    for item in items:
+        url = item.get("website") or item.get("url")
+        d = _clean_domain(url)
+        
+        # KEY CHECK: Czy domena jest na liście zatwierdzonej przez AI?
+        if not d or d not in clean_approved: continue
+        
+        if d not in existing_domains_map:
+            title = item.get("title") or item.get("title", d)
+            category = item.get("categoryName") or "Web Search"
+            total_score = item.get("totalScore", 0) 
+            
+            quality_score = int(total_score * 20) if total_score else 60
+
+            new_company = GlobalCompany(
+                domain=d,
+                name=title,
+                pain_points=[f"Source: {category}", f"Query: {query}"],
+                is_active=True,
+                quality_score=quality_score
+            )
+            new_companies_to_add.append(new_company)
+            existing_domains_map[d] = new_company 
+    
+    # Zapis nowych firm
+    if new_companies_to_add:
+        session.add_all(new_companies_to_add)
+        session.commit()
+        for c in new_companies_to_add:
+            existing_domains_map[c.domain] = c
+
+    # 3. Przetwarzanie Leadów
+    current_company_ids = [c.id for c in existing_domains_map.values()]
+    
+    leads_in_campaign = session.query(Lead.global_company_id).filter(
+        Lead.campaign_id == campaign_id,
+        Lead.global_company_id.in_(current_company_ids)
+    ).all()
+    ids_in_this_campaign = {l[0] for l in leads_in_campaign}
+    
+    new_leads_to_add = []
+    
+    for domain in clean_approved:
+        if added_count >= SAFETY_LIMIT_LEADS: break
+        
+        company_obj = existing_domains_map.get(domain)
+        if not company_obj: continue
+
+        if company_obj.id in ids_in_this_campaign: continue
+
+        last_contact = session.query(Lead).filter(
+            Lead.global_company_id == company_obj.id,
+            Lead.status == "SENT"
+        ).order_by(desc(Lead.sent_at)).first()
+
+        if last_contact and last_contact.sent_at:
+            days_since = (datetime.now() - last_contact.sent_at).days
+            if days_since < GLOBAL_CONTACT_COOLDOWN:
+                print(f"      ⏳ {domain}: KARENCJA ({days_since} dni). Skip.")
+                continue
+
+        new_lead = Lead(
+            campaign_id=campaign_id,
+            global_company_id=company_obj.id,
+            status="NEW",
+            ai_confidence_score=company_obj.quality_score or 50
+        )
+        new_leads_to_add.append(new_lead)
+        ids_in_this_campaign.add(company_obj.id)
+        added_count += 1
+
+    if new_leads_to_add:
+        session.add_all(new_leads_to_add)
+        session.commit()
+        
+    return len(new_leads_to_add)
+
+
+async def run_scout_async(session: Session, campaign_id: int, strategy: StrategyOutput) -> int:
+    """
+    Silnik Zwiadowczy v6.0 (AI Gatekeeper Enhanced).
+    """
+    if not client:
+        print("❌ Scout Error: Klient Apify nie jest zainicjowany.")
+        return 0
+
+    # Pobieramy kontekst klienta RAZ na początku
+    client_data = _get_client_icp(session, campaign_id)
+    print(f"🕵️ [SCOUT] Kontekst AI: Szukam dla branży '{client_data['industry']}'")
+
+    total_added = 0
+    
+    raw_queries = strategy.search_queries
+    valid_queries, client_id = await asyncio.to_thread(_db_get_valid_queries, session, campaign_id, raw_queries)
+    
+    if not valid_queries:
+        print("   💤 Scout: Brak nowych zapytań (wszystkie wykorzystane).")
+        return 0
+
+    print(f"🚀 [ASYNC SCOUT] Startuję zwiad dla: {valid_queries}")
+
+    for query in valid_queries:
+        if total_added >= SAFETY_LIMIT_LEADS:
+            print(f"   🧨 LIMIT LEADOW OSIĄGNIĘTY. Stop.")
+            break
+
+        print(f"   📍 Wykonuję: '{query}'...")
+        
+        use_google_search = False
+        if "remote" in query.lower() or "saas" in query.lower() or "startup" in query.lower() or "software" in query.lower():
+            use_google_search = True
+            print("      🌐 Tryb: GOOGLE SEARCH")
+        else:
+            print("      🗺️  Tryb: GOOGLE MAPS")
+
+        history_id = await asyncio.to_thread(_db_create_history_entry, session, client_id, query)
+
+        items = []
+        try:
+            if not use_google_search:
+                run_input = {
+                    "searchStringsArray": [query],
+                    "maxCrawledPlacesPerSearch": BATCH_SIZE,
+                    "language": "pl",
+                    "skipClosedPlaces": True,
+                    "onlyWebsites": True,
+                }
+                run = await client.actor(ACTOR_MAPS).call(run_input=run_input)
+            else:
+                clean_query = query + " -site:linkedin.com -site:facebook.com -site:youtube.com"
+                run_input = {
+                    "queries": clean_query, 
+                    "resultsPerPage": BATCH_SIZE,
+                    "countryCode": "pl",
+                    "languageCode": "pl",
+                }
+                run = await client.actor(ACTOR_SEARCH).call(run_input=run_input)
+
+            if run:
+                dataset = client.dataset(run["defaultDatasetId"])
+                dataset_items_page = await dataset.list_items()
+                raw_items = dataset_items_page.items
+                
+                if use_google_search:
+                    for ri in raw_items:
+                        items.extend(ri.get("organicResults", []))
+                else:
+                    items = raw_items
+
+            if not items:
+                print("      ⚠️ Brak wyników w Apify.")
+                continue
+
+            await asyncio.to_thread(_db_update_history_results, session, history_id, len(items))
+            print(f"      📥 Pobranno {len(items)} surowych wyników.")
+
+            # --- AI GATEKEEPER STEP ---
+            # Zamiast wrzucać wszystko, pytamy Gemini co jest wartościowe
+            approved_domains = await _ai_filter_batch(items, client_data)
+            
+            if not approved_domains:
+                print("      🗑️ AI odrzuciło wszystkie wyniki jako nieistotne.")
+                continue
+
+            # --- PROCESS BATCH ---
+            added_in_batch = await asyncio.to_thread(
+                _db_process_scraped_items, 
+                session, 
+                campaign_id, 
+                items, 
+                query, 
+                approved_domains # Przekazujemy przefiltrowaną listę
+            )
+            
+            print(f"      💾 Zapisano {added_in_batch} unikalnych leadów (z {len(approved_domains)} zaakceptowanych).")
+            total_added += added_in_batch
+
+        except Exception as e:
+            print(f"      ❌ Błąd w Async Scout: {e}")
+            # await asyncio.sleep(1) # Opcjonalne
+
+    print(f"🏁 [SCOUT] Koniec tury. Wynik: {total_added}/{SAFETY_LIMIT_LEADS}")
+    return total_added

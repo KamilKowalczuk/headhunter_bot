@@ -124,10 +124,9 @@ async def _parallel_scrape(urls: list) -> dict:
     
     tasks = []
     for url in urls:
-        # Dodajemy opóźnienie między dodaniem zadań, żeby nie uderzyć w 5 endpointów w 1ms
-        # To pomaga ominąć proste WAF-y i Rate Limity
+        # Dodajemy opóźnienie 1s, żeby nie uderzyć w 5 endpointów w 1ms
         tasks.append(scraper.scrape(url))
-        await asyncio.sleep(0.5) # <--- RATE LIMIT FIX (500ms delay)
+        await asyncio.sleep(1.0) # <--- RATE LIMIT FIX (1s delay)
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
@@ -231,28 +230,59 @@ def analyze_lead(session: Session, lead_id: int):
     regex_hint = ""
     if regex_emails:
         regex_hint = (
-            f"ZNALAZŁEM NASTĘPUJĄCE MAILE W KODZIE HTML (TO SĄ FAKTY): {', '.join(regex_emails)}. "
-            f"DODAJ JE DO LISTY contact_emails."
+            f"### DOWODY Z KODU (REGEX - HARD DATA):\n"
+            f"W kodzie źródłowym HTML znaleziono te adresy: {', '.join(regex_emails)}.\n"
+            f"Są to faktyczne adresy. Twoim zadaniem jest ocenić, do kogo należą, ale MUSISZ je uwzględnić w analizie."
         )
 
     if mode == "JOB_HUNT":
         system_prompt = f"""
-        Jesteś Analitykiem Rynku Pracy IT.
-        Analizujesz surową treść ze strony WWW.
-        ZADANIA PRIORYTETOWE:
-        1. **E-MAIL:** {regex_hint} Szukaj maili do HR, Rekrutacji (kariera@, jobs@) LUB do CTO/Team Leaderów.
-        2. **TECH STACK:** (np. Python, AWS, React).
-        3. **HIRING:** Czy mają zakładkę "Kariera"?
-        4. **DECYDENT:** Szukaj imion: CTO, HR Manager, Founder.
+        Jesteś Cyfrowym Analitykiem Rynku Pracy. Przetwarzasz surowe dane (Markdown/HTML) ze strony firmy, aby ocenić jej potencjał jako pracodawcy.
+
+        {regex_hint}
+
+        TWOJE ZADANIE - EKSTRAKCJA FAKTÓW:
+        1. **E-MAILE (Krytyczne):**
+           - Szukaj adresów bezpośrednich do ludzi: (imię.nazwisko@, rekrutacja@, hr@).
+           - Jeśli widzisz maila w sekcji "Kontakt" lub "Team", wyciągnij go.
+        
+        2. **TECHNOLOGIA I KULTURA (Kontekst):**
+           - Nie zgaduj. Szukaj słów kluczowych: "Python", "AWS", "React", "Remote", "B2B", "Flat structure".
+           - Jeśli strona wygląda nowocześnie i wymienia startupowe benefity, zaznacz to.
+
+        3. **HIRING SIGNALS (Czy rosną?):**
+           - Czy mają zakładkę "Kariera"? Czy lista ofert jest długa?
+           - Czy copyright w stopce jest aktualny (2025/2026)?
+
+        4. **DECYDENCI:**
+           - Jeśli znajdziesz imiona założycieli, CTO, Head of People - zapisz je w polu decision_makers.
+
+        Skup się na konkretach. Jeśli nie ma informacji, wpisz "Brak danych". Nie halucynuj.
         """
     else:
         system_prompt = f"""
-        Jesteś analitykiem B2B. Analizujesz treść ze strony WWW.
-        ZADANIE:
-        1. **E-MAIL:** {regex_hint} Szukaj w sekcjach "Kontakt", "Stopka".
-        2. Stack Tech & Hiring (Sygnał rozwoju).
-        3. Icebreaker (Punkt zaczepienia).
-        Priorytety maili: Imienne > Biuro/Kontakt > Sprzedaż.
+        Jesteś Specjalistą Business Intelligence. Przeprowadzasz audyt strony potencjalnego klienta B2B.
+        Twoim celem jest znalezienie "Haka" (Icebreaker) oraz kontaktu do decydenta.
+
+        {regex_hint}
+
+        ANALIZA STRATEGICZNA (Extraction Protocol):
+        1. **E-MAILE (Priorytet Absolutny):**
+           - Imienne (jan.kowalski@...) są warte złota.
+           - Ogólne (biuro@, kontakt@) są akceptowalne, ale niższy priorytet.
+           - Unikaj maili technicznych (webmaster@, privacy@).
+        
+        2. **BÓL I POTRZEBY (Icebreaker):**
+           - Zanalizuj, co firma robi i czym się chwali.
+           - Czy strona wygląda na przestarzałą? (Możliwy lead na redesign).
+           - Czy chwalą się nową inwestycją? (Pieniądze na stole).
+           - Czy używają żargonu branżowego? Użyj go w Icebreakerze.
+
+        3. **STACK I TECHNOLOGIA:**
+           - Jeśli sprzedajemy usługi IT, musisz wiedzieć co mają (WordPress? Custom? Shopify?).
+           - Szukaj śladów w stopce lub w opisach usług.
+
+        Twoja odpowiedź musi być JSON-em zgodnym ze schematem. W polu 'summary' napisz 2 zdania syntezy o firmie dla handlowca.
         """
     
     try:

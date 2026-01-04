@@ -34,62 +34,68 @@ def generate_strategy(client: Client, raw_intent: str, campaign_id: int) -> Stra
     mode = getattr(client, "mode", "SALES") # Domyślnie SALES jeśli brak pola
     
     if mode == "JOB_HUNT":
-        # --- STRATEGIA REKRUTACYJNA ---
+        # --- STRATEGIA REKRUTACYJNA (HUNTER MODE) ---
         system_prompt = """
-        Jesteś Ekspertem Rynku Pracy i Headhunterem Technologicznym.
-        Twoim celem jest znalezienie firm (Pracodawców), do których użytkownik może aplikować o pracę.
-        Szukamy firm z potencjałem rekrutacyjnym, nawet jeśli nie mają oficjalnych ogłoszeń (Ukryty Rynek Pracy).
-        
-        DANE KANDYDATA (UŻYTKOWNIKA):
-        - Imię/Marka: {sender_name}
-        - Specjalizacja: {sender_industry}
-        - Umiejętności (Bio): {value_proposition}
-        - Wymarzony Pracodawca (Target): {icp}
-        
-        CEL POSZUKIWAŃ: {intent}
-        
-        !!! HISTORIA ZAPYTAŃ (TE HASŁA JUŻ BYŁY - UNIKAJ ICH):
+        Jesteś Architektem Kariery i Specjalistą OSINT. Twoim zadaniem jest zhackowanie algorytmu wyszukiwania Google Maps, aby znaleźć ukryte perły rynku pracy dla Twojego klienta.
+
+        ### PROFIL KANDYDATA (Input):
+        - Imię: {sender_name}
+        - Branża: {sender_industry}
+        - Supermoce (Skills): {value_proposition}
+        - Cel (Dream Company): {icp}
+        - Intencja: {intent}
+
+        ### HISTORIA ZAPYTAŃ (Blacklist - Tego NIE wolno Ci użyć):
         [{used_queries_str}]
-        
-        TAKTYKA "JOB HUNTER":
-        1. Szukaj firm pasujących do profilu technologicznego kandydata.
-        2. Używaj fraz określających typ firmy: "Software House", "Agencja Interaktywna", "Startup AI", "Fintech".
-        3. Łącz to z lokalizacjami (Dzielnice, Miasta).
-        4. UNIKAJ ogólnych haseł typu "Praca Warszawa". Szukamy FIRM, a nie ogłoszeń.
-        5. Format zapytania do map: "[Typ Firmy/Technologia] [Miasto/Dzielnica]".
-           Np. "Django Software House Wrocław", "Agencja SEO Mokotów".
-        
-        Wygeneruj od 5 do 8 unikalnych zapytań do Google Maps.
+
+        ### TWOJA MISJA:
+        Musisz wygenerować 5-8 zapytań do Google Maps, które odkryją firmy technologiczne, startupy i software house'y, które NIEkoniecznie mają wystawione ogłoszenia na portalach pracy (Ukryty Rynek).
+
+        ### ZASADY GENEROWANIA ZAPYTAŃ (Protocol 11/10):
+        1. **Precyzja Geograficzna:** Nie wpisuj "Warszawa". Wpisuj dzielnice biznesowe (np. "Wola", "Mokotów", "Zabłocie") lub miasta satelickie, gdzie konkurencja kandydatów jest mniejsza.
+        2. **Dywersyfikacja Semantyczna:**
+           - Zamiast "Software House", użyj: "Agencja Python", "SaaS Development", "Fintech Startup", "AI Lab", "E-commerce implementation".
+           - Szukaj po technologiach, jeśli to ma sens (np. "React Agency").
+        3. **Wykluczenia:** Nie szukaj "Biuro pracy" ani "Agencja rekrutacyjna". Szukamy BEZPOŚREDNICH pracodawców.
+        4. **Format wyjściowy:** Czysty string zapytania, np. "React Native Studio Wrocław Krzyki".
+
+        Twoje zapytania muszą być RÓŻNORODNE. Nie generuj 5 razy tego samego z inną dzielnicą. Mieszaj branże z lokalizacjami.
         """
     else:
-        # --- STRATEGIA SPRZEDAŻOWA (STANDARD) ---
+        # --- STRATEGIA SPRZEDAŻOWA (SALES SNIPER MODE) ---
         system_prompt = """
-        Jesteś Ekspertem Strategii B2B i OSINT.
-        Twoim celem jest wygenerowanie zapytań do GOOGLE MAPS, aby znaleźć potencjalnych KLIENTÓW.
-        
-        DANE MOJEGO KLIENTA (SPRZEDAWCY):
+        Jesteś Strategiem Lead Generation B2B o IQ 190. Twoim jedynym celem jest nakarmienie lejka sprzedażowego kalorycznymi leadami, których konkurencja nie widzi.
+
+        ### DANE SPRZEDAWCY (Twój Klient):
         - Nazwa: {sender_name}
         - Branża: {sender_industry}
-        - Oferta (UVP): {value_proposition}
-        - Kogo szukamy (ICP): {icp}
-        
-        CEL KAMPANII: {intent}
-        
-        !!! HISTORIA ZAPYTAŃ (TE HASŁA JUŻ BYŁY - UNIKAJ ICH):
+        - Value Proposition: {value_proposition}
+        - Idealny Klient (ICP): {icp}
+        - Cel Kampanii: {intent}
+
+        ### HISTORIA ZAPYTAŃ (Blacklist - Tego NIE wolno Ci użyć):
         [{used_queries_str}]
+
+        ### STRATEGIA "LATERAL SEARCH" (Protocol 11/10):
+        Google Maps to wyszukiwarka słów kluczowych, a nie intencji. Musisz przekładać ICP na fizyczne szyldy firm.
         
-        TAKTYKA "INFINITE SEARCH":
-        1. Unikaj duplikatów z Historii.
-        2. Eksploruj dzielnice i miasta satelickie.
-        3. Używaj synonimów branż i nisz (np. zamiast "Sklep", wpisz "Hurtownia odzieży").
-        4. Format: "[Rodzaj Firmy] [Lokalizacja]".
-        
-        Wygeneruj od 5 do 8 zupełnie nowych, precyzyjnych zapytań.
+        1. **Zasada Synonimów Biznesowych:**
+           - Jeśli szukamy "Restauracji", szukaj też: "Bistro", "Gastrobar", "Sushi", "Pizzeria", "Fine Dining".
+           - Jeśli szukamy "Firm budowlanych", szukaj też: "Deweloper", "Generalny Wykonawca", "Remonty biur", "Usługi dekarskie".
+        2. **Mikro-Lokalizacje:**
+           - Unikaj ogólnych miast (np. "Warszawa"). Algorytm Google utnie wyniki po 20 rekordach.
+           - Wchodź w dzielnice, ulice biznesowe, miasta ościenne. To tam są nieodkryci klienci.
+        3. **Kreatywne Nisze:**
+           - Zastanów się, kto MA PIENIĄDZE i potrzebuje usług {sender_industry}, ale nie jest oczywistym celem.
+        4. **Anti-Duplication Shield:**
+           - Pod żadnym pozorem nie powtarzaj zapytań z sekcji "HISTORIA ZAPYTAŃ". To marnowanie budżetu.
+
+        Masz wygenerować od 5 do 8 chirurgicznie precyzyjnych zapytań w formacie: "[Nisza/Branża] [Konkretna Lokalizacja]".
         """
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
-        ("human", "Przygotuj strategię wyszukiwania.")
+        ("human", "Analizuj ICP i generuj listę celów.")
     ])
 
     chain = prompt | structured_llm

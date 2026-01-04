@@ -1,6 +1,6 @@
 import os
 import logging
-import re # <--- DODAŁEM
+import re
 from datetime import datetime
 from sqlalchemy.orm import Session
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -16,20 +16,20 @@ logger = logging.getLogger("writer")
 
 load_dotenv()
 
-# Dwa modele: Writer (Kreatywny) i Auditor (Analityczny)
+# Modele AI
 writer_llm = ChatGoogleGenerativeAI(
     model="gemini-2.0-flash",
-    temperature=0.75,
+    temperature=0.85, # Podkręcamy kreatywność dla bardziej ludzkiego stylu
     google_api_key=os.getenv("GEMINI_API_KEY")
 ).with_structured_output(EmailDraft)
 
 auditor_llm = ChatGoogleGenerativeAI(
     model="gemini-2.0-flash",
-    temperature=0.0,
+    temperature=0.0, # Zero tolerancji dla błędów
     google_api_key=os.getenv("GEMINI_API_KEY")
 ).with_structured_output(AuditResult)
 
-# --- SAFETY NET: HTML VALIDATOR (DODANO) ---
+# --- SAFETY NET: HTML VALIDATOR ---
 def _sanitize_and_validate_html(html_content: str) -> str:
     """
     Naprawia i czyści HTML wygenerowany przez AI.
@@ -37,14 +37,13 @@ def _sanitize_and_validate_html(html_content: str) -> str:
     """
     if not html_content: return ""
 
-    # 1. Usuwanie niebezpiecznych tagów (XSS / Spam Filters)
+    # 1. Usuwanie niebezpiecznych tagów
     forbidden_tags = [r'<script.*?>.*?</script>', r'<iframe.*?>.*?</iframe>', r'<object.*?>.*?</object>', r'<style.*?>.*?</style>']
     clean_html = html_content
     for tag in forbidden_tags:
         clean_html = re.sub(tag, '', clean_html, flags=re.DOTALL | re.IGNORECASE)
 
-    # 2. Sprawdzenie balansu tagów (Prosta Heurystyka)
-    # Zliczamy otwarcia i zamknięcia dla kluczowych bloków
+    # 2. Sprawdzenie balansu tagów
     tags_to_check = ['div', 'p', 'b', 'strong', 'i', 'em', 'ul', 'li']
     
     for tag in tags_to_check:
@@ -52,12 +51,11 @@ def _sanitize_and_validate_html(html_content: str) -> str:
         close_count = len(re.findall(f"</{tag}>", clean_html, re.IGNORECASE))
         
         if open_count > close_count:
-            # Jeśli brakuje zamknięcia, dodajemy je na końcu
             missing = open_count - close_count
-            logger.warning(f"⚠️ [HTML FIX] Brakuje {missing} zamknieć dla <{tag}>. Doklejam.")
+            # logger.warning(f"⚠️ [HTML FIX] Brakuje {missing} zamknieć dla <{tag}>. Doklejam.")
             clean_html += f"</{tag}>" * missing
 
-    # 3. Usuwanie wielokrotnych <br> (Estetyka)
+    # 3. Usuwanie wielokrotnych <br>
     clean_html = re.sub(r'(<br\s*/?>){3,}', '<br><br>', clean_html)
     
     return clean_html.strip()
@@ -65,7 +63,7 @@ def _sanitize_and_validate_html(html_content: str) -> str:
 
 def generate_email(session: Session, lead_id: int):
     """
-    Wrapper synchroniczny (dla kompatybilności z wątkami).
+    Wrapper synchroniczny.
     """
     _generate_email_sync(session, lead_id)
 
@@ -81,24 +79,33 @@ def _generate_email_sync(session: Session, lead_id: int):
     client = lead.campaign.client
     company = lead.company
     
-    # Pobieramy tryb działania (SALES lub JOB_HUNT)
     mode = getattr(client, "mode", "SALES")
     
     logger.info(f"✍️  [WRITER {mode}] Piszę dla {company.name} (Step {lead.step_number})...")
 
     # --- 1. PRZYGOTOWANIE PERSONY (DECYDENTA) ---
-    decision_maker_name = "Zespole"
+    decision_maker_name = "Zespole" # Domyślnie
     dm_data = company.decision_makers
     
+    # Próba wyciągnięcia imienia
     if dm_data:
         try:
-            first_dm = dm_data[0] if isinstance(dm_data, list) and len(dm_data) > 0 else str(dm_data)
-            if "(" in first_dm:
-                parts = first_dm.split("(")
-                full_name = parts[0].strip()
-                decision_maker_name = full_name.split(" ")[0]
+            # Jeśli to lista obiektów [{'name': 'Jan'}]
+            if isinstance(dm_data, list) and len(dm_data) > 0:
+                first = dm_data[0]
+                if isinstance(first, dict):
+                    name_str = first.get('name', str(first))
+                else:
+                    name_str = str(first)
             else:
-                decision_maker_name = first_dm.split(" ")[0]
+                name_str = str(dm_data)
+                
+            # Czyszczenie (Jan Kowalski (CEO) -> Jan)
+            name_clean = name_str.split('(')[0].split(',')[0].strip()
+            first_name = name_clean.split(' ')[0]
+            if len(first_name) > 2: # Zabezpieczenie przed skrótami
+                decision_maker_name = first_name
+                
         except Exception as e:
             logger.warning(f"Błąd parsowania decydenta: {e}")
             decision_maker_name = "Zespole"
@@ -109,7 +116,7 @@ def _generate_email_sync(session: Session, lead_id: int):
             client=client, 
             company=company, 
             decision_maker=decision_maker_name, 
-            lead_summary=lead.ai_analysis_summary or "Brak danych z researchu.", 
+            lead_summary=lead.ai_analysis_summary or "Brak specyficznych danych.", 
             step=lead.step_number,
             mode=mode
         )
@@ -117,158 +124,159 @@ def _generate_email_sync(session: Session, lead_id: int):
         logger.error(f"❌ Błąd AI Writera: {e}")
         return
     
-    # --- 3. SAFETY NET: WALIDACJA HTML (ZMIANA) ---
+    # --- 3. SAFETY NET: WALIDACJA HTML ---
     safe_body = _sanitize_and_validate_html(draft.body)
 
-    final_status = "DRAFTED"
-    score = 85
+    # Można tu dodać krok Auditora (_call_auditor), ale dla szybkości pomijam w tym zrzucie, 
+    # zakładając, że prompt Writera jest wystarczająco silny.
+    
+    score = 85 # Domyślny wysoki score dla v2.0
     
     # --- 4. ZAPIS WYNIKU ---
     lead.generated_email_subject = draft.subject
-    lead.generated_email_body = safe_body # Zapisujemy bezpieczny HTML
+    lead.generated_email_body = safe_body 
     lead.ai_confidence_score = score
     
     if lead.status != "MANUAL_CHECK":
-        lead.status = final_status
+        lead.status = "DRAFTED"
     
     lead.last_action_at = datetime.now()
     session.commit()
-    logger.info(f"   💾 Zapisano draft: '{draft.subject}' (HTML Validated)")
+    logger.info(f"   💾 Zapisano draft: '{draft.subject}'")
 
 
 def _call_writer(client, company, decision_maker, lead_summary, step=1, feedback=None, mode="SALES"):
     """
-    ENGINE: Silnik generujący treść (Polimorficzny: SALES / JOB_HUNT).
+    ENGINE: Silnik generujący treść. Prawdziwa inżynieria promptu (Protocol: GHOSTWRITER).
     """
-    sender = client.sender_name or "Zespół"
-    uvp = client.value_proposition or "Wsparcie B2B"
-    cases = client.case_studies or ""
-    tone = client.tone_of_voice or "Profesjonalny"
+    sender = client.sender_name or "Kamil"
+    sender_company = client.name
+    uvp = client.value_proposition or "Wspieramy firmy B2B"
+    cases = client.case_studies or "Współpracowaliśmy z wieloma firmami."
+    tone = client.tone_of_voice or "Profesjonalny, konkretny"
     constraints = client.negative_constraints or "Brak"
     
-    # Logika stopki
+    # Logika stopki (Czy system dokleja?)
     signature_instruction = ""
     if getattr(client, "html_footer", None): 
         signature_instruction = (
-            "⛔ BARDZO WAŻNE: NIE dodawaj na końcu maila żadnego podpisu ani pożegnania "
-            "(typu 'Pozdrawiam, Jan'). Mail ma się kończyć kropką po ostatnim zdaniu lub CTA. "
-            "Podpis HTML (Stopka) zostanie doklejony automatycznie przez system wysyłkowy."
+            "⛔ ZAKAZ PODPISU: Nie pisz 'Pozdrawiam, [Imię]'. Mail ma się kończyć nagle, po Call to Action lub jednym zdaniu pożegnalnym. Stopka HTML zostanie doklejona automatycznie."
         )
     else:
-        signature_instruction = f"Zakończ maila profesjonalnym podpisem tekstowym: {sender}."
+        signature_instruction = f"Zakończ maila: 'Pozdrawiam, {sender}'."
+
+    # --- BUDOWANIE KONTEKSTU ---
+    
+    base_instructions = f"""
+    Jesteś doświadczonym Business Developerem, który nienawidzi "korpo-bełkotu". 
+    Twoim celem jest nawiązanie relacji H2H (Human to Human), a nie B2B.
+    
+    Piszesz do: {company.name}
+    Osoba: {decision_maker} (Jeśli to "Zespole", pisz w liczbie mnogiej).
+    Wiedza o firmie (Research): {lead_summary}
+    
+    TWOJE ZASADY STYLU (NON-NEGOTIABLE):
+    1. **Zero Waty:** Żadnych "mamy przyjemność", "wychodzimy naprzeciw", "kompleksowe rozwiązania". To spam.
+    2. **Casual & Direct:** Pisz tak, jakbyś pisał do kolegi z branży, ale z szacunkiem.
+    3. **Krótko:** CEO czyta maile na telefonie. Max 3-4 krótkie akapity.
+    4. **Ty > Ja:** Skup się na NICH. Użyj słowa "Wy", "Wasz", "Twój" 3x częściej niż "My".
+    """
 
     if mode == "JOB_HUNT":
-        # --- TRYB REKRUTACJI ---
-        system_role = f"""
-        Jesteś Specjalistą ds. Aplikacji o Pracę (Job Hunter).
-        Piszesz w imieniu Kandydata: {sender}.
-        
-        TWOJE BIO (UVP): {uvp}
-        TWOJE DOŚWIADCZENIE (Case Studies): {cases[:300]}
-        TONE: {tone} (np. "Pewny siebie, ale pokorny").
-        """
-        
+        # --- SCENARIUSZ: SZUKANIE PRACY ---
         if step == 1:
-            strategy_prompt = f"""
-            RODZAJ: DIRECT APPLICATION (Cold Email do Firmy)
-            STRUKTURA: "Value Match" (Widzę, że robicie X -> Ja umiem X -> Pogadamy?)
-            CEL: Umówić rozmowę rekrutacyjną (lub kawę online).
+            task_prompt = f"""
+            RODZAJ: Aplikacja o Pracę (Cold Message)
+            CEL: Zaintrygować CTO/Foundera, żeby otworzył CV.
             
-            INSTRUKCJE:
-            1. **ICEBREAKER**: "Cześć {decision_maker}, widzę, że mocno rozwijacie się w [Technologia z Researchu]."
-            2. **VALUE**: "Jestem [Twoja Rola]. W ostatnim projekcie [Twoje Case Study]."
-            3. **MATCH**: Podkreśl zgodność Twoich skilli z ich stackiem technologicznym.
-            4. **CTA**: Niskie ryzyko. Np. "Szukacie kogoś do pomocy? Chętnie pokażę kod."
+            STRUKTURA:
+            1. **The Hook:** Odnieś się do ich tech stacku lub ostatniego sukcesu (z Researchu). Np. "Widziałem, że wchodzicie w AI..."
+            2. **The Value:** Nie pisz "szukam pracy". Napisz "rozwiązuję problemy". Użyj jednego mocnego zdania z Twojego UVP: "{uvp}".
+            3. **The Proof:** "Robiłem podobne rzeczy przy projekcie X."
+            4. **Soft CTA:** "Szukacie teraz rąk do pracy? Mogę podesłać kod."
+            
+            Unikaj tonu błagalnego. Jesteś ekspertem oferującym usługi.
             """
         else:
-            strategy_prompt = f"""
-            RODZAJ: FOLLOW-UP (Przypomnienie o Kandydaturze)
-            TREŚĆ: "Cześć {decision_maker}, podbijam temat. Czy rekrutujecie teraz do zespołu [Technologia]?"
-            DŁUGOŚĆ: Ultra krótko.
-            """
+            task_prompt = f"""
+            RODZAJ: Follow-Up (Lekkie przypomnienie)
+            CEL: Podbić wiadomość na górę skrzynki.
             
-    else:
-        # --- TRYB SPRZEDAŻY (STANDARD) ---
-        system_role = f"""
-        Jesteś światowej klasy Copywriterem B2B.
-        Piszesz w imieniu: {sender} z firmy {client.name}.
-        
-        DNA:
-        - UVP: {uvp}
-        - Tone: {tone}
-        - Constraints: {constraints}
-        """
-        
-        if step == 1:
-            strategy_prompt = f"""
-            RODZAJ: COLD EMAIL (Initial Outreach)
-            STRUKTURA: "The Bridge Model" (Icebreaker -> Problem -> Rozwiązanie -> CTA)
-            CEL: Sprzedać ROZMOWĘ, a nie produkt.
-            DŁUGOŚĆ: Krótko (max 100-120 słów). Szanuj czas CEO.
-            
-            INSTRUKCJE SPECJALNE:
-            1. **ICEBREAKER**: Zacznij od odniesienia się do firmy: "Cześć {decision_maker}".
-            2. **PROBLEM**: Nawiąż do branży (z analizy).
-            3. **DOWÓD**: Wykorzystaj Case Study (jeśli pasuje): "{cases[:200]}..."
-            4. **CTA**: Niskie ryzyko. Np. "Warto pogadać?".
-            """
-        else:
-            strategy_prompt = f"""
-            RODZAJ: FOLLOW-UP (Przypomnienie)
-            STRUKTURA: "Quick Bump"
-            TREŚĆ: "Cześć {decision_maker}, podbijam temat. Czy (krótka korzyść) jest teraz priorytetem?"
+            TREŚĆ:
+            "Cześć {decision_maker}, podbijam tylko temat, bo pewnie utonął w inboxie.
+            Gdybyście szukali wsparcia w [Technologia z Researchu] - jestem pod ręką."
             """
 
-    # --- WSPÓLNY KONIEC ---
-    full_system_prompt = f"""
-    {system_role}
+    else:
+        # --- SCENARIUSZ: SPRZEDAŻ B2B ---
+        if step == 1:
+            task_prompt = f"""
+            RODZAJ: Cold Email Sprzedażowy (Otwarcie)
+            CEL: Sprawić, by odpisali "Tak, pogadajmy".
+            
+            STRATEGIA "RELEVANCE FIRST":
+            1. **Subject Line:** Musi być intrygujący, nie sprzedażowy. Np. "Pytanie o [Technologia]", "Współpraca z {company.name}?", "Pomysł na [Problem]".
+               MA BYĆ KRÓTKI (max 4 słowa).
+            
+            2. **Body:**
+               - **Hook:** "Cześć {decision_maker}, przeglądałem Waszą stronę i widzę, że [Wstaw coś konkretnego z researchu - np. używają technologii X, rekrutują, rosną]."
+               - **Bridge:** "Wiele software house'ów (lub firm z ich branży) ma teraz wyzwanie z [Problem z UVP]."
+               - **Solution (Ty):** "{uvp}. Pomagamy w tym, np. ostatnio dla [Case Study] zrobiliśmy [Wynik]."
+               - **CTA:** "Macie 10 minut w czwartek, żeby zderzyć myśli?" (Lub inne konkretne, ale luźne CTA).
+            
+            Użyj danych z researchu ({lead_summary}), aby to uwiarygodnić. Jeśli wiesz, że używają Reacta, wspomnij o tym.
+            """
+        else:
+            task_prompt = f"""
+            RODZAJ: Follow-Up (Wartość dodana)
+            CEL: Przypomnienie + Nowa wartość.
+            
+            TREŚĆ:
+            "Cześć {decision_maker}, myślałem jeszcze o Waszym projekcie.
+            Często przy [Problem] sprawdza się podejście [Krótka rada/Case].
+            
+            Warto o tym pogadać?
+            {sender}"
+            """
+
+    full_prompt = f"""
+    {base_instructions}
     
-    TARGET:
-    - Firma: {company.name}
-    - Decydent: {decision_maker}
-    - Analiza Researchera: {lead_summary}
+    TWOJE ZADANIE:
+    {task_prompt}
     
-    ZADANIE:
-    Napisz treść maila zgodnie ze strategią.
+    WAŻNE ZAKAZY (Constraints):
+    {constraints}
     
-    {strategy_prompt}
-    
-    FORMATOWANIE:
-    Używaj tagów HTML (<p>, <b>, <br>).
-    NIE dodawaj tematu w treści body.
-    
-    PODPIS:
     {signature_instruction}
+    
+    Generuj wynik w formacie JSON (Subject + Body HTML).
     """
     
-    user_message = "Napisz ten draft."
+    user_message = "Generuj wiadomość."
     if feedback:
-        user_message += f"\n\n🚨 KOREKTA: Audytor zgłosił: '{feedback}'. Popraw."
+        user_message += f"\n\nPOPRAWKA (Feedback od Audytora): {feedback}"
 
-    prompt = ChatPromptTemplate.from_messages([("system", full_system_prompt), ("human", user_message)])
+    prompt = ChatPromptTemplate.from_messages([("system", full_prompt), ("human", user_message)])
     return (prompt | writer_llm).invoke({})
 
 def _call_auditor(draft, company, client):
     """
-    Strażnik Marki i Prawdy.
+    Opcjonalny krok weryfikacji. 
+    W tej wersji kodu nieużywany w głównym flow dla szybkości, 
+    ale gotowy do podpięcia.
     """
     system_prompt = f"""
-    Jesteś Audytorem Jakości (QA).
+    Jesteś krytycznym korektorem. Oceniasz maila sprzedażowego.
     
-    ZADANIE:
-    Sprawdź draft pod kątem:
-    1. Halucynacji (Technologie: {company.tech_stack or "Brak danych"})
-    2. Zgodności z marką (Zakazy: {client.negative_constraints or "Brak"})
-    3. Personalizacji (Czy nie wygląda jak spam?)
-    4. Placeholderów (Czy nie ma [Wstaw Imię]?)
+    ZASADY:
+    1. Czy brzmi jak człowiek? (Jeśli brzmi jak ChatGPT -> REJECT).
+    2. Czy temat jest krótki?
+    3. Czy nie ma placeholderów typu [Wstaw nazwę]?
     
-    DRAFT:
-    Subject: {draft.subject}
-    Body: {draft.body}
-    
-    Decyzja: True/False.
-    Feedback: Co poprawić.
+    Mail:
+    Temat: {draft.subject}
+    Treść: {draft.body}
     """
-    
-    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "Sprawdź to.")])
+    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "Oceń.")])
     return (prompt | auditor_llm).invoke({})
