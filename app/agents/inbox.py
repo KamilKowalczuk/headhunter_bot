@@ -1,7 +1,7 @@
 import imaplib
 import email
 import os
-import re  # <--- DODAŁEM (do szukania maili w treści zwrotki)
+import re 
 from email.header import decode_header
 from datetime import datetime
 from sqlalchemy.orm import Session
@@ -13,7 +13,7 @@ from app.schemas import ReplyAnalysis
 
 load_dotenv()
 
-# --- KONFIGURACJA GUARDIANA (DODANO) ---
+# --- KONFIGURACJA GUARDIANA ---
 BOUNCE_KEYWORDS = [
     "delivery status notification",
     "delivery failure",
@@ -57,14 +57,17 @@ def get_email_body(msg):
 
 def check_inbox(session: Session, client: Client):
     """Sprawdza skrzynkę odbiorczą w poszukiwaniu odpowiedzi LUB zwrotek."""
-    print(f"📬 INBOX: Sprawdzam pocztę dla {client.name} ({client.smtp_user})...")
+    # print(f"📬 INBOX: Sprawdzam pocztę dla {client.name} ({client.smtp_user})...")
     
     if not client.imap_server:
-        print("   ❌ Brak konfiguracji IMAP.")
+        # print("   ❌ Brak konfiguracji IMAP.")
         return
 
     try:
-        mail = imaplib.IMAP4_SSL(client.imap_server, client.imap_port or 993)
+        # === OPTYMALIZACJA NEXUS: TIMEOUT (ANTI-ZOMBIE) ===
+        # Dodajemy timeout=10s. Jeśli serwer nie odpowie w 10s, rzucamy wyjątek i zwalniamy wątek.
+        mail = imaplib.IMAP4_SSL(client.imap_server, client.imap_port or 993, timeout=10)
+        
         mail.login(client.smtp_user, client.smtp_password)
         mail.select("INBOX")
 
@@ -73,9 +76,10 @@ def check_inbox(session: Session, client: Client):
         email_ids = messages[0].split()
         if not email_ids:
             # print("   📭 Brak nowych wiadomości.") 
+            mail.logout() # Ważne: Wyloguj się nawet jak nie ma wiadomości
             return
 
-        print(f"   📨 Znaleziono {len(email_ids)} nowych maili. Analizuję...")
+        print(f"   📨 {client.name}: Znaleziono {len(email_ids)} nowych maili. Analizuję...")
 
         for e_id in email_ids:
             _, msg_data = mail.fetch(e_id, '(RFC822)')
@@ -86,24 +90,20 @@ def check_inbox(session: Session, client: Client):
                     # Dane nagłówkowe
                     sender_header = decode_mime_words(msg.get("From"))
                     sender_email = email.utils.parseaddr(sender_header)[1]
-                    subject = decode_mime_words(msg.get("Subject", "")).lower() # <--- DODAŁEM (potrzebne do bounce)
-                    body = get_email_body(msg) # Pobieramy wcześniej, bo potrzebne i tu, i tu
+                    subject = decode_mime_words(msg.get("Subject", "")).lower() 
+                    body = get_email_body(msg) 
 
                     # =================================================================
-                    # --- SEKCJA GUARDIAN: WYKRYWANIE BOUNCES (DODANO) ---
-                    # Sprawdzamy, czy to zwrotka, zanim sprawdzimy czy to Lead
+                    # --- SEKCJA GUARDIAN: WYKRYWANIE BOUNCES ---
                     is_bounce = False
                     if "mailer-daemon" in sender_email.lower() or any(k in subject for k in BOUNCE_KEYWORDS):
                         print(f"   🚨 [BOUNCE] Wykryto zwrotkę: {subject}")
                         is_bounce = True
                         
-                        # Próbujemy znaleźć, jaki mail nie dotarł (szukamy w treści zwrotki)
-                        # Szukamy leadów z tej kampanii, których email pojawia się w treści błędu
                         potential_failed_emails = re.findall(r'[\w.+-]+@[\w-]+\.[\w.-]+', body)
                         
                         found_bounce_lead = False
                         if potential_failed_emails:
-                            # Szukamy w bazie leada, którego email jest w treści zwrotki
                             bounced_lead = session.query(Lead).filter(
                                 Lead.target_email.in_(potential_failed_emails)
                             ).first()
@@ -119,10 +119,10 @@ def check_inbox(session: Session, client: Client):
                         if not found_bounce_lead:
                             print("      ⚠️ Nie udało się powiązać zwrotki z leadem.")
                         
-                        continue # <--- WAŻNE: Jeśli to zwrotka, przerywamy pętlę tutaj, nie analizujemy AI
+                        continue 
                     # =================================================================
 
-                    # 2. CZY TO NASZ LEAD? (Twój oryginalny kod)
+                    # 2. CZY TO NASZ LEAD?
                     lead = session.query(Lead).filter(
                         (Lead.target_email == sender_email) | 
                         (Lead.company.has(domain=sender_email.split('@')[-1]))
@@ -134,11 +134,10 @@ def check_inbox(session: Session, client: Client):
 
                     print(f"   🎯 O! Odpisał LEAD ID {lead.id}: {sender_email}")
                     
-                    # 3. POBIERZ TREŚĆ (już pobrana wyżej)
-                    if not body:
-                        continue
+                    # 3. POBIERZ TREŚĆ 
+                    if not body: continue
 
-                    # 4. ANALIZA AI (Twój oryginalny kod)
+                    # 4. ANALIZA AI
                     try:
                         analysis = analyst_llm.invoke(f"Przeanalizuj odpowiedź od klienta:\n\n{body[:2000]}")
                         
@@ -164,5 +163,7 @@ def check_inbox(session: Session, client: Client):
         mail.close()
         mail.logout()
 
+    except TimeoutError:
+        print(f"   ⏳ [TIMEOUT] Serwer IMAP klienta {client.name} nie odpowiada (10s). Skip.")
     except Exception as e:
-        print(f"   ❌ Błąd IMAP: {e}")
+        print(f"   ❌ Błąd IMAP dla {client.name}: {e}")

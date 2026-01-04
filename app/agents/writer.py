@@ -1,6 +1,6 @@
 import os
 import logging
-import asyncio
+import re # <--- DODAŁEM
 from datetime import datetime
 from sqlalchemy.orm import Session
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -28,6 +28,40 @@ auditor_llm = ChatGoogleGenerativeAI(
     temperature=0.0,
     google_api_key=os.getenv("GEMINI_API_KEY")
 ).with_structured_output(AuditResult)
+
+# --- SAFETY NET: HTML VALIDATOR (DODANO) ---
+def _sanitize_and_validate_html(html_content: str) -> str:
+    """
+    Naprawia i czyści HTML wygenerowany przez AI.
+    Chroni przed rozsypaniem się maila w Outlooku.
+    """
+    if not html_content: return ""
+
+    # 1. Usuwanie niebezpiecznych tagów (XSS / Spam Filters)
+    forbidden_tags = [r'<script.*?>.*?</script>', r'<iframe.*?>.*?</iframe>', r'<object.*?>.*?</object>', r'<style.*?>.*?</style>']
+    clean_html = html_content
+    for tag in forbidden_tags:
+        clean_html = re.sub(tag, '', clean_html, flags=re.DOTALL | re.IGNORECASE)
+
+    # 2. Sprawdzenie balansu tagów (Prosta Heurystyka)
+    # Zliczamy otwarcia i zamknięcia dla kluczowych bloków
+    tags_to_check = ['div', 'p', 'b', 'strong', 'i', 'em', 'ul', 'li']
+    
+    for tag in tags_to_check:
+        open_count = len(re.findall(f"<{tag}[^>]*>", clean_html, re.IGNORECASE))
+        close_count = len(re.findall(f"</{tag}>", clean_html, re.IGNORECASE))
+        
+        if open_count > close_count:
+            # Jeśli brakuje zamknięcia, dodajemy je na końcu
+            missing = open_count - close_count
+            logger.warning(f"⚠️ [HTML FIX] Brakuje {missing} zamknieć dla <{tag}>. Doklejam.")
+            clean_html += f"</{tag}>" * missing
+
+    # 3. Usuwanie wielokrotnych <br> (Estetyka)
+    clean_html = re.sub(r'(<br\s*/?>){3,}', '<br><br>', clean_html)
+    
+    return clean_html.strip()
+# -------------------------------------------
 
 def generate_email(session: Session, lead_id: int):
     """
@@ -77,22 +111,21 @@ def _generate_email_sync(session: Session, lead_id: int):
             decision_maker=decision_maker_name, 
             lead_summary=lead.ai_analysis_summary or "Brak danych z researchu.", 
             step=lead.step_number,
-            mode=mode # Przekazujemy tryb
+            mode=mode
         )
     except Exception as e:
         logger.error(f"❌ Błąd AI Writera: {e}")
         return
     
-    # --- 3. AUDYT JAKOŚCI (SAFETY NET) ---
-    # logger.info("   👮 [AUDITOR] Weryfikacja faktów...")
-    # audit = _call_auditor(draft, company, client)
-    
+    # --- 3. SAFETY NET: WALIDACJA HTML (ZMIANA) ---
+    safe_body = _sanitize_and_validate_html(draft.body)
+
     final_status = "DRAFTED"
     score = 85
     
     # --- 4. ZAPIS WYNIKU ---
     lead.generated_email_subject = draft.subject
-    lead.generated_email_body = draft.body
+    lead.generated_email_body = safe_body # Zapisujemy bezpieczny HTML
     lead.ai_confidence_score = score
     
     if lead.status != "MANUAL_CHECK":
@@ -100,7 +133,7 @@ def _generate_email_sync(session: Session, lead_id: int):
     
     lead.last_action_at = datetime.now()
     session.commit()
-    logger.info(f"   💾 Zapisano draft: '{draft.subject}'")
+    logger.info(f"   💾 Zapisano draft: '{draft.subject}' (HTML Validated)")
 
 
 def _call_writer(client, company, decision_maker, lead_summary, step=1, feedback=None, mode="SALES"):

@@ -1,11 +1,11 @@
 import os
 import re
-import requests
+import httpx  # <--- ZMIANA: httpx zamiast requests
 import json
 import logging
 import html
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# from concurrent.futures import ThreadPoolExecutor, as_completed # <--- USUNIĘTE (Zastąpione przez asyncio.gather)
 from datetime import datetime
 from sqlalchemy.orm import Session
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -63,13 +63,13 @@ def extract_emails_from_html(raw_html: str) -> list:
     return clean
 
 class TitanScraper:
-    """Klient Firecrawl - Tryb Hybrydowy."""
+    """Klient Firecrawl - Tryb Async (HTTPX)."""
     def __init__(self, api_key):
         self.api_key = api_key
         self.base_url = "https://api.firecrawl.dev/v1"
         self.headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    def scrape(self, url):
+    async def scrape(self, url):  # <--- ZMIANA: async def
         """Pobiera HTML (dla Regexa) i Markdown (dla AI)."""
         if not self.api_key: return None
         
@@ -81,79 +81,87 @@ class TitanScraper:
             "timeout": 20000,
             "excludeTags": ["script", "style", "video", "canvas"] 
         }
-        try:
-            response = requests.post(endpoint, headers=self.headers, json=payload, timeout=30)
-            if response.status_code == 200:
-                data = response.json().get('data', {})
-                if not data.get('markdown') and not data.get('html'):
-                    return None
-                return {
-                    "markdown": data.get('markdown', ""),
-                    "html": data.get('html', "")
-                }
-            return None
-        except Exception as e:
-            logger.error(f"Błąd scrapowania {url}: {e}")
-            return None
+        
+        # Używamy httpx.AsyncClient dla nieblokujących zapytań
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                response = await client.post(endpoint, headers=self.headers, json=payload)
+                if response.status_code == 200:
+                    data = response.json().get('data', {})
+                    if not data.get('markdown') and not data.get('html'):
+                        return None
+                    return {
+                        "markdown": data.get('markdown', ""),
+                        "html": data.get('html', "")
+                    }
+                return None
+            except Exception as e:
+                logger.error(f"Błąd scrapowania {url}: {e}")
+                return None
 
-    def map_site(self, url):
+    async def map_site(self, url): # <--- ZMIANA: async def
         """Mapuje stronę."""
         if not self.api_key: return []
         
         endpoint = f"{self.base_url}/map"
         payload = {"url": url, "search": "contact about team career kontakt o-nas zespol kariera"}
-        try:
-            response = requests.post(endpoint, headers=self.headers, json=payload, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                return data.get('links', []) or data.get('data', {}).get('links', [])
-            return []
-        except:
-            return []
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            try:
+                response = await client.post(endpoint, headers=self.headers, json=payload)
+                if response.status_code == 200:
+                    data = response.json()
+                    return data.get('links', []) or data.get('data', {}).get('links', [])
+                return []
+            except:
+                return []
 
 scraper = TitanScraper(firecrawl_key)
 
-def _parallel_scrape(urls: list) -> dict:
-    """Wielowątkowe pobieranie."""
+async def _parallel_scrape(urls: list) -> dict: # <--- ZMIANA: async def
+    """Wielowątkowe pobieranie (Async Gather)."""
     combined_markdown = ""
     all_html_emails = []
     
     urls = list(set(urls))
     
-    print(f"         🚀 Uruchamiam {len(urls)} wątków scrapingowych...")
+    print(f"         🚀 Uruchamiam {len(urls)} zadań async scrapingowych...")
     
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_url = {executor.submit(scraper.scrape, url): url for url in urls}
-        for future in as_completed(future_to_url):
-            url = future_to_url[future]
-            try:
-                result = future.result()
-                if result:
-                    # 1. Regex z HTML
-                    if result.get("html"):
-                        found = extract_emails_from_html(result["html"])
-                        if found:
-                            print(f"            👀 Znaleziono w HTML ({url}): {found}")
-                            all_html_emails.extend(found)
-                    
-                    # 2. Markdown dla AI
-                    md = result.get("markdown", "")
-                    if len(md) > 50:
-                        section_name = "STRONA"
-                        if "contact" in url or "kontakt" in url: section_name = "KONTAKT"
-                        elif "about" in url or "o-nas" in url: section_name = "O NAS"
-                        
-                        combined_markdown += f"\n\n=== {section_name} ({url}) ===\n{md[:15000]}"
-            except Exception as e:
-                logger.error(f"Błąd wątku {url}: {e}")
+    # Zastępujemy ThreadPoolExecutor przez asyncio.gather (prawdziwa równoległość IO)
+    tasks = [scraper.scrape(url) for url in urls]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    for i, result in enumerate(results):
+        url = urls[i]
+        
+        if isinstance(result, Exception):
+            logger.error(f"Błąd zadania {url}: {result}")
+            continue
+            
+        if result:
+            # 1. Regex z HTML
+            if result.get("html"):
+                found = extract_emails_from_html(result["html"])
+                if found:
+                    print(f"            👀 Znaleziono w HTML ({url}): {found}")
+                    all_html_emails.extend(found)
+            
+            # 2. Markdown dla AI
+            md = result.get("markdown", "")
+            if len(md) > 50:
+                section_name = "STRONA"
+                if "contact" in url or "kontakt" in url: section_name = "KONTAKT"
+                elif "about" in url or "o-nas" in url: section_name = "O NAS"
+                
+                combined_markdown += f"\n\n=== {section_name} ({url}) ===\n{md[:15000]}"
                 
     return {
         "markdown": combined_markdown,
         "regex_emails": list(set(all_html_emails))
     }
 
-def _get_content_titan_strategy(url: str) -> str:
-    """Strategia BULLDOZER: Mapowanie + Wymuszone Ścieżki."""
+async def _get_content_titan_strategy(url: str) -> dict: # <--- ZMIANA: async def
+    """Strategia BULLDOZER: Mapowanie + Wymuszone Ścieżki (Async)."""
     print(f"      🔥 [TITAN] Cel: {url}")
     
     base_url = url.rstrip('/')
@@ -165,7 +173,8 @@ def _get_content_titan_strategy(url: str) -> str:
         f"{base_url}/about"
     ]
     
-    mapped_links = scraper.map_site(url)
+    # Async Mapowanie
+    mapped_links = await scraper.map_site(url)
     final_list = forced_pages.copy()
     
     if mapped_links:
@@ -185,313 +194,13 @@ def _get_content_titan_strategy(url: str) -> str:
     target_urls = clean_urls[:5]
 
     print(f"         🎯 Lista celów: {[u.split('/')[-1] for u in target_urls]}")
-    return _parallel_scrape(target_urls)
+    # Async Scraping
+    return await _parallel_scrape(target_urls)
 
 def analyze_lead(session: Session, lead_id: int):
     """
-    RESEARCHER V4: BULLDOZER EDITION (Synchroniczna Wersja Wewnętrzna).
-    """
-    lead = session.query(Lead).filter(Lead.id == lead_id).first()
-    if not lead: return
-
-    company = lead.company
-    print(f"\n   🔎 [RESEARCHER] Analiza: {company.name}")
-    
-    target_url = get_main_domain_url(company.domain)
-    if not target_url.startswith("http"): target_url = "https://" + target_url
-
-    # 1. POBIERANIE (Bulldozer Strategy)
-    scan_result = _get_content_titan_strategy(target_url)
-    
-    content_md = scan_result["markdown"]
-    regex_emails = scan_result["regex_emails"]
-
-    if not content_md and not regex_emails:
-        print(f"      ❌ PUSTY ZWIAD. Próba 404 na wszystkich podstronach.")
-        lead.status = "MANUAL_CHECK"
-        session.commit()
-        return
-
-    # 2. ANALIZA AI
-    print(f"      🧠 Gemini analizuje dane...")
-    
-    regex_hint = ""
-    if regex_emails:
-        regex_hint = (
-            f"ZNALAZŁEM NASTĘPUJĄCE MAILE W KODZIE HTML (TO SĄ FAKTY): {', '.join(regex_emails)}. "
-            f"DODAJ JE DO LISTY contact_emails."
-        )
-
-    system_prompt = f"""
-    Jesteś analitykiem B2B. Analizujesz surową treść HTML/Markdown z kilku podstron firmy.
-    
-    ZADANIE:
-    1. **E-MAIL:** {regex_hint} Szukaj w sekcjach "Kontakt", "Stopka".
-    2. Stack Tech & Hiring.
-    3. Icebreaker.
-    
-    Priorytety maili: Imienne > Biuro/Kontakt/Hello > Sprzedaż.
-    Ignoruj: przykładowe domeny, webmasterów, grafikę.
-    """
-    
-    try:
-        chain = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{text}")]).pipe(structured_llm)
-        research = chain.invoke({"text": content_md[:70000]})
-    except Exception as e:
-        print(f"      ❌ Błąd LLM: {e}")
-        # RATUNEK REGEXEM
-        if regex_emails:
-            print("      ⚠️ LLM Error. Ratuję lead mailami z HTML.")
-            lead.target_email = regex_emails[0]
-            lead.status = "ANALYZED"
-            lead.ai_confidence_score = 50
-            lead.ai_analysis_summary = "HTML RESCUE MODE. LLM FAILED."
-            session.commit()
-            return
-        lead.status = "MANUAL_CHECK"
-        session.commit()
-        return
-
-    # 3. MERGE & SCORE
-    combined_emails = list(set((research.contact_emails or []) + regex_emails))
-    
-    def score_email(email):
-        s = 0
-        e = email.lower()
-        if any(x in e for x in ['ceo', 'owner', 'founder', 'prezes']): s += 20
-        if any(x in e for x in ['biuro', 'info', 'hello', 'kontakt', 'office']): s += 15
-        if '.' in e.split('@')[0]: s += 5
-        if any(x in e for x in ['kariera', 'jobs', 'rekrutacja']): s -= 20
-        if not verify_email_domain(e): s -= 100
-        return s
-
-    valid_email = None
-    if combined_emails:
-        scored = sorted([(e, score_email(e)) for e in combined_emails], key=lambda x: x[1], reverse=True)
-        print(f"      📧 Scoring: {scored}")
-        
-        best_email, score = scored[0]
-        if score > -20:
-            valid_email = best_email
-
-    # 4. ZAPIS
-    company.tech_stack = research.tech_stack
-    company.decision_makers = research.decision_makers
-    company.industry = research.target_audience
-    company.last_scraped_at = datetime.now() # Fix: utcnow -> now
-    
-    lead.ai_analysis_summary = (
-        f"ICEBREAKER: {research.icebreaker}\n"
-        f"SUMMARY: {research.summary}\n"
-        f"MAILS: {combined_emails}\n"
-        f"HIRING: {research.hiring_signals}\n"
-        f"PAIN: {research.pain_points_or_opportunities}"
-    )
-    
-    if valid_email:
-        lead.target_email = valid_email
-        lead.status = "ANALYZED"
-        lead.ai_confidence_score = 95
-        print(f"      ✅ SUKCES: {valid_email}")
-    else:
-        lead.status = "MANUAL_CHECK"
-        lead.ai_confidence_score = 15
-        print(f"      ⚠️ MANUAL CHECK")
-
-    session.commit()
-
-# --- NOWOŚĆ: ASYNC WRAPPER ---
-async def analyze_lead_async(session: Session, lead_id: int):import os
-import re
-import requests
-import json
-import logging
-import html
-import asyncio
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
-from sqlalchemy.orm import Session
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate
-from dotenv import load_dotenv
-
-# Importy z aplikacji
-from app.database import Lead, GlobalCompany
-from app.tools import verify_email_domain, get_main_domain_url
-from app.schemas import CompanyResearch
-
-# Konfiguracja loggera
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("researcher")
-
-load_dotenv()
-
-# Konfiguracja API
-gemini_key = os.getenv("GEMINI_API_KEY")
-firecrawl_key = os.getenv("FIRECRAWL_API_KEY")
-
-if not firecrawl_key:
-    logger.error("❌ CRITICAL: Brak FIRECRAWL_API_KEY w .env. Researcher nie zadziała.")
-
-# Model AI
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.1, google_api_key=gemini_key)
-structured_llm = llm.with_structured_output(CompanyResearch)
-
-# --- NARZĘDZIA POMOCNICZE (SNIPER TOOLS) ---
-
-def extract_emails_from_html(raw_html: str) -> list:
-    """Ekstrakcja z BRUDNEGO HTMLa (X-RAY)."""
-    if not raw_html: return []
-    
-    text = html.unescape(raw_html)
-    emails = []
-    
-    # 1. Linki mailto (Priorytet)
-    mailto_pattern = r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'
-    emails.extend(re.findall(mailto_pattern, text))
-    
-    # 2. Tekst
-    text_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-    emails.extend(re.findall(text_pattern, text))
-    
-    unique = list(set(e.lower() for e in emails))
-    clean = []
-    for email in unique:
-        if email.endswith(('.png', '.jpg', '.jpeg', '.gif', '.css', '.js', '.svg', '.woff', '.webp', '.mp4')): continue
-        if any(x in email for x in ['sentry', 'noreply', 'no-reply', 'example', 'domain', 'email.com', 'bootstrap', 'react']): continue
-        if len(email) < 5 or len(email) > 60: continue
-        clean.append(email)
-        
-    return clean
-
-class TitanScraper:
-    """Klient Firecrawl - Tryb Hybrydowy."""
-    def __init__(self, api_key):
-        self.api_key = api_key
-        self.base_url = "https://api.firecrawl.dev/v1"
-        self.headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-    def scrape(self, url):
-        """Pobiera HTML (dla Regexa) i Markdown (dla AI)."""
-        if not self.api_key: return None
-        
-        endpoint = f"{self.base_url}/scrape"
-        payload = {
-            "url": url, 
-            "formats": ["markdown", "html"], 
-            "onlyMainContent": False, # WAŻNE: Pobieramy stopki!
-            "timeout": 20000,
-            "excludeTags": ["script", "style", "video", "canvas"] 
-        }
-        try:
-            response = requests.post(endpoint, headers=self.headers, json=payload, timeout=30)
-            if response.status_code == 200:
-                data = response.json().get('data', {})
-                if not data.get('markdown') and not data.get('html'):
-                    return None
-                return {
-                    "markdown": data.get('markdown', ""),
-                    "html": data.get('html', "")
-                }
-            return None
-        except Exception as e:
-            logger.error(f"Błąd scrapowania {url}: {e}")
-            return None
-
-    def map_site(self, url):
-        """Mapuje stronę."""
-        if not self.api_key: return []
-        
-        endpoint = f"{self.base_url}/map"
-        payload = {"url": url, "search": "contact about team career kontakt o-nas zespol kariera"}
-        try:
-            response = requests.post(endpoint, headers=self.headers, json=payload, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                return data.get('links', []) or data.get('data', {}).get('links', [])
-            return []
-        except:
-            return []
-
-scraper = TitanScraper(firecrawl_key)
-
-def _parallel_scrape(urls: list) -> dict:
-    """Wielowątkowe pobieranie."""
-    combined_markdown = ""
-    all_html_emails = []
-    
-    urls = list(set(urls))
-    
-    print(f"         🚀 Uruchamiam {len(urls)} wątków scrapingowych...")
-    
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_url = {executor.submit(scraper.scrape, url): url for url in urls}
-        for future in as_completed(future_to_url):
-            url = future_to_url[future]
-            try:
-                result = future.result()
-                if result:
-                    # 1. Regex z HTML
-                    if result.get("html"):
-                        found = extract_emails_from_html(result["html"])
-                        if found:
-                            print(f"            👀 Znaleziono w HTML ({url}): {found}")
-                            all_html_emails.extend(found)
-                    
-                    # 2. Markdown dla AI
-                    md = result.get("markdown", "")
-                    if len(md) > 50:
-                        section_name = "STRONA"
-                        if "contact" in url or "kontakt" in url: section_name = "KONTAKT"
-                        elif "about" in url or "o-nas" in url: section_name = "O NAS"
-                        
-                        combined_markdown += f"\n\n=== {section_name} ({url}) ===\n{md[:15000]}"
-            except Exception as e:
-                logger.error(f"Błąd wątku {url}: {e}")
-                
-    return {
-        "markdown": combined_markdown,
-        "regex_emails": list(set(all_html_emails))
-    }
-
-def _get_content_titan_strategy(url: str) -> str:
-    """Strategia BULLDOZER: Mapowanie + Wymuszone Ścieżki."""
-    print(f"      🔥 [TITAN] Cel: {url}")
-    
-    base_url = url.rstrip('/')
-    forced_pages = [
-        base_url,
-        f"{base_url}/kontakt",
-        f"{base_url}/contact",
-        f"{base_url}/o-nas",
-        f"{base_url}/about"
-    ]
-    
-    mapped_links = scraper.map_site(url)
-    final_list = forced_pages.copy()
-    
-    if mapped_links:
-        keywords = ["team", "zespol", "kariera", "career", "praca"]
-        interesting = [l for l in mapped_links if any(k in l.lower() for k in keywords)]
-        final_list.extend(interesting[:2])
-
-    clean_urls = []
-    seen = set()
-    for u in final_list:
-        if u in seen: continue
-        if any(ext in u.lower() for ext in ['.pdf', '.jpg', '.png', '#']): continue
-        clean_urls.append(u)
-        seen.add(u)
-
-    clean_urls.sort(key=lambda x: 0 if 'kontakt' in x or 'contact' in x else 1)
-    target_urls = clean_urls[:5]
-
-    print(f"         🎯 Lista celów: {[u.split('/')[-1] for u in target_urls]}")
-    return _parallel_scrape(target_urls)
-
-def analyze_lead(session: Session, lead_id: int):
-    """
-    RESEARCHER V4: BULLDOZER EDITION (Synchroniczna Wersja Wewnętrzna).
+    RESEARCHER V4: BULLDOZER EDITION (Wrapper Synchroniczny).
+    Uruchamia asynchroniczny scraping wewnątrz synchronicznej funkcji.
     """
     lead = session.query(Lead).filter(Lead.id == lead_id).first()
     if not lead: return
@@ -505,8 +214,13 @@ def analyze_lead(session: Session, lead_id: int):
     target_url = get_main_domain_url(company.domain)
     if not target_url.startswith("http"): target_url = "https://" + target_url
 
-    # 1. POBIERANIE (Bulldozer Strategy)
-    scan_result = _get_content_titan_strategy(target_url)
+    # 1. POBIERANIE (Bulldozer Strategy - RUN ASYNC IN SYNC CONTEXT)
+    # Używamy asyncio.run, aby odpalić szybki event loop dla httpx wewnątrz wątku roboczego
+    try:
+        scan_result = asyncio.run(_get_content_titan_strategy(target_url))
+    except Exception as e:
+        logger.error(f"      ❌ Błąd Async Loop w Research: {e}")
+        scan_result = {"markdown": "", "regex_emails": []}
     
     content_md = scan_result["markdown"]
     regex_emails = scan_result["regex_emails"]
@@ -631,16 +345,12 @@ def analyze_lead(session: Session, lead_id: int):
 
     session.commit()
 
-# --- NOWOŚĆ: ASYNC WRAPPER ---
+# --- ASYNC WRAPPER DLA PĘTLI GŁÓWNEJ ---
 async def analyze_lead_async(session: Session, lead_id: int):
     """
     Asynchroniczny wrapper dla researchera.
-    """
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, analyze_lead, session, lead_id)
-    """
-    Asynchroniczny wrapper dla researchera.
-    Uruchamia ciężki proces scrapowania w osobnym wątku, nie blokując pętli głównej.
+    Uruchamia ciężki proces scrapowania w osobnym wątku (przez analyze_lead),
+    a wewnątrz wątku odpala się mini-loop AsyncIO dla httpx.
     """
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, analyze_lead, session, lead_id)

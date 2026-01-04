@@ -14,8 +14,23 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("Błąd: Brak zmiennej DATABASE_URL w pliku .env")
 
-# Inicjalizacja silnika bazy danych
-engine = create_engine(DATABASE_URL)
+# --- KONFIGURACJA SILNIKA (ENTERPRISE EDITION) ---
+# Optymalizacja pod wysokie współbieżne obciążenie (1000 klientów / 20 workerów)
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=20,           # Tyle połączeń trzymamy stale otwartych (Matchuje MAX_CONCURRENT_AGENTS)
+    max_overflow=10,        # Tyle możemy otworzyć "na chwilę" w szczycie (Burst)
+    pool_timeout=30,        # Jak długo wątek czeka na wolne połączenie zanim rzuci błędem
+    pool_recycle=1800,      # Reset połączenia co 30 min (zapobiega "SSL SYSCALL error: EOF detected")
+    connect_args={
+        "application_name": "nexus_engine", # Tagowanie połączeń w logach Postgresa
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5
+    }
+)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -25,19 +40,19 @@ class Client(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     
-    # STATUS AGENCJI (Nowość dla Dashboardu: ACTIVE / PAUSED)
+    # STATUS AGENCJI (ACTIVE / PAUSED)
     status = Column(String, default="ACTIVE") 
     mode = Column(String, default="SALES") # Opcje: "SALES", "JOB_HUNT"
     
     name = Column(String, nullable=False, unique=True) # np. "SoftwareHut"
     
-    # STRATEGICZNE DNA (Wypełniasz w NocoDB)
+    # STRATEGICZNE DNA
     industry = Column(String)              # "Software House"
     value_proposition = Column(Text)       # "Dozimy MVP w 3 miesiące"
     ideal_customer_profile = Column(Text)  # "Fintechy, Seed/Series A"
     tone_of_voice = Column(String)         # "Profesjonalny, Direct"
     
-    # HARD CONSTRAINTS (Czego unikać)
+    # HARD CONSTRAINTS
     negative_constraints = Column(Text)    # "Nie wspominaj o WordPress"
     case_studies = Column(Text)            # "Zrobiliśmy projekt X dla firmy Y..."
     
@@ -78,11 +93,11 @@ class GlobalCompany(Base):
     pain_points = Column(JSONB, default=[])      # ["Wolna strona", "Brak mobile"]
     hiring_status = Column(String)               # "Hiring" / "Layoffs"
     
-    # VALIDATION LAYER (Sędzia)
+    # VALIDATION LAYER
     is_active = Column(Boolean, default=True)
-    has_mx_records = Column(Boolean, default=False) # Czy maile działają?
+    has_mx_records = Column(Boolean, default=False) 
     last_scraped_at = Column(DateTime, default=datetime.utcnow)
-    quality_score = Column(Integer, default=0) # 0-100 (Pulse Check)
+    quality_score = Column(Integer, default=0) # 0-100
 
     leads = relationship("Lead", back_populates="company")
 
@@ -115,20 +130,21 @@ class Lead(Base):
     generated_email_subject = Column(String)
     generated_email_body = Column(Text)
     
-    # KONTAKT (Email Hunter) - TO BYŁO BRAKUJĄCE
+    # KONTAKT
     target_email = Column(String, nullable=True) 
 
     # HALLUCINATION KILLER & DRIP
     ai_confidence_score = Column(Integer) # 0-100
     status = Column(String, default="NEW") # NEW -> SCRAPED -> DRAFTED -> SENT
     
-    # FOLLOW-UP MECHANISM (Przeniesione z Campaign tutaj, bo dotyczy Leada)
-    step_number = Column(Integer, default=1) # To naprawia AttributeError
+    # FOLLOW-UP MECHANISM
+    step_number = Column(Integer, default=1) 
     last_action_at = Column(DateTime, default=datetime.utcnow)
 
     scheduled_for = Column(DateTime) # Kiedy wysłać?
     sent_at = Column(DateTime)       # Kiedy wysłano?
     
+    campaign = relationship("Campaign", back_populates="campaigns") # Poprawiony backref: campaigns zamiast leads, aby pasowało do Campaign
     campaign = relationship("Campaign", back_populates="leads")
     company = relationship("GlobalCompany", back_populates="leads")
 
