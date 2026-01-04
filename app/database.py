@@ -27,6 +27,7 @@ class Client(Base):
     
     # STATUS AGENCJI (Nowość dla Dashboardu: ACTIVE / PAUSED)
     status = Column(String, default="ACTIVE") 
+    mode = Column(String, default="SALES") # Opcje: "SALES", "JOB_HUNT"
     
     name = Column(String, nullable=False, unique=True) # np. "SoftwareHut"
     
@@ -50,6 +51,14 @@ class Client(Base):
     imap_port = Column(Integer, default=993)
     daily_limit = Column(Integer, default=50) # Bezpiecznik wysyłki
     html_footer = Column(String, nullable=True) # Kod HTML stopki
+
+    # --- WARM-UP CONFIG ---
+    warmup_enabled = Column(Boolean, default=False)       # Czy rozgrzewka włączona?
+    warmup_start_limit = Column(Integer, default=2)       # Od ilu zaczynamy?
+    warmup_increment = Column(Integer, default=2)         # O ile zwiększamy dziennie?
+    warmup_started_at = Column(DateTime, nullable=True)   # Kiedy zaczęliśmy?
+
+    sending_mode = Column(String, default="DRAFT")
 
     attachment_filename = Column(String, nullable=True)
 

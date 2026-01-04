@@ -5,12 +5,12 @@ from typing import List, Dict, Any, Set
 from urllib.parse import urlparse
 from apify_client import ApifyClientAsync
 from sqlalchemy.orm import Session
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, desc # <--- ZMIANA: Dodano 'desc' do sortowania dat
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # Importy aplikacji
-from app.database import GlobalCompany, Lead, SearchHistory # <--- NOWY IMPORT
+from app.database import GlobalCompany, Lead, SearchHistory
 from app.schemas import StrategyOutput
 
 # --- KONFIGURACJA ENTERPRISE ---
@@ -19,10 +19,11 @@ logger = logging.getLogger("scout")
 APIFY_TOKEN = os.getenv("APIFY_API_TOKEN")
 
 # === BEZPIECZNIKI (FUSES) ===
-BATCH_SIZE = 40             # Ile pobieramy z Google Maps na jedno zapytanie
-SAFETY_LIMIT_LEADS = 20     # Max nowych leadów na cykl
-SAFETY_LIMIT_QUERIES = 2    # Max zapytań na cykl (oszczędzamy budżet)
-DUPLICATE_COOLDOWN_DAYS = 30 # Jak często możemy powtórzyć to samo zapytanie?
+BATCH_SIZE = 40             
+SAFETY_LIMIT_LEADS = 20     
+SAFETY_LIMIT_QUERIES = 2    
+DUPLICATE_COOLDOWN_DAYS = 30 # Historia wyszukiwania Scouta
+GLOBAL_CONTACT_COOLDOWN = 30 # <--- ZMIANA: Okres karencji dla firmy (dni)
 # ============================
 
 ACTOR_ID = "compass/crawler-google-places"
@@ -47,7 +48,7 @@ def _clean_domain(website_url: str) -> str | None:
 
 async def run_scout_async(session: Session, campaign_id: int, strategy: StrategyOutput) -> int:
     """
-    Silnik Zwiadowczy v4.0 (Memory + Precision Mode).
+    Silnik Zwiadowczy v5.0 (Recycling Mode).
     """
     if not client:
         print("❌ Scout Error: Klient Apify nie jest zainicjowany.")
@@ -56,14 +57,9 @@ async def run_scout_async(session: Session, campaign_id: int, strategy: Strategy
     total_added = 0
     
     # 1. FILTRACJA ZAPYTAŃ (MEMORY CHECK)
-    # Sprawdzamy historię, żeby nie palić budżetu na to samo
     raw_queries = strategy.search_queries
     valid_queries = []
     
-    # Pobieramy ID klienta z kampanii (potrzebne do historii)
-    # Zakładamy, że strategy zostało wywołane z poprawnym client context, 
-    # ale tutaj potrzebujemy client_id. Pobierzmy je z kampanii.
-    # (W main.py przekazujemy campaign_id, więc możemy pobrać klienta)
     from app.database import Campaign
     campaign_obj = session.query(Campaign).filter(Campaign.id == campaign_id).first()
     client_id = campaign_obj.client_id if campaign_obj else None
@@ -71,11 +67,10 @@ async def run_scout_async(session: Session, campaign_id: int, strategy: Strategy
     print(f"\n🧠 [SCOUT MEMORY] Analizuję {len(raw_queries)} propozycji strategii...")
 
     for q in raw_queries:
-        # Sprawdź czy szukaliśmy tego w ostatnich 30 dniach dla tego klienta
         last_search = session.query(SearchHistory).filter(
             SearchHistory.client_id == client_id,
             SearchHistory.query_text == q,
-            SearchHistory.searched_at > datetime.utcnow() - timedelta(days=DUPLICATE_COOLDOWN_DAYS)
+            SearchHistory.searched_at > datetime.now() - timedelta(days=DUPLICATE_COOLDOWN_DAYS)
         ).first()
 
         if last_search:
@@ -83,7 +78,6 @@ async def run_scout_async(session: Session, campaign_id: int, strategy: Strategy
         else:
             valid_queries.append(q)
 
-    # Bierzemy tylko TOP X unikalnych zapytań
     final_queries = valid_queries[:SAFETY_LIMIT_QUERIES]
     
     if not final_queries:
@@ -91,7 +85,6 @@ async def run_scout_async(session: Session, campaign_id: int, strategy: Strategy
         return 0
 
     print(f"🚀 [ASYNC SCOUT] Startuję zwiad dla: {final_queries}")
-    print(f"   🎯 Cel: Max {SAFETY_LIMIT_LEADS} leadów.")
 
     for query in final_queries:
         if total_added >= SAFETY_LIMIT_LEADS:
@@ -100,16 +93,12 @@ async def run_scout_async(session: Session, campaign_id: int, strategy: Strategy
 
         print(f"   📍 Wykonuję: '{query}'...")
         
-        # --- ZMIANA KONFIGURACJI APIFY (PRECISION MODE) ---
-        # Usuwamy 'locationQuery' i 'countryCode', żeby nie robić Grid Crawl.
-        # Polegamy na tym, że 'query' zawiera nazwę miasta (AI o to dba).
         run_input = {
             "searchStringsArray": [query],
-            "maxCrawledPlacesPerSearch": BATCH_SIZE, # Limit wyników na jedno hasło
+            "maxCrawledPlacesPerSearch": BATCH_SIZE,
             "language": "pl",
             "skipClosedPlaces": True,
-            "onlyWebsites": True, # Kluczowe dla B2B
-            # Wyłączamy zbędne dane = szybciej i taniej
+            "onlyWebsites": True,
             "scrapeReviewerName": False,
             "scrapeReviewerId": False,
             "scrapeReviewText": False,
@@ -118,13 +107,11 @@ async def run_scout_async(session: Session, campaign_id: int, strategy: Strategy
         }
 
         try:
-            # Rejestrujemy próbę w historii (nawet jak nic nie znajdzie, żeby nie próbować ciągle błędnych haseł)
             if client_id:
                 history_entry = SearchHistory(query_text=query, client_id=client_id, results_found=0)
                 session.add(history_entry)
-                session.commit() # Commit od razu, żeby zapisać "że próbowaliśmy"
+                session.commit()
 
-            # Call Apify
             run = await client.actor(ACTOR_ID).call(run_input=run_input)
             if not run: continue
 
@@ -136,13 +123,12 @@ async def run_scout_async(session: Session, campaign_id: int, strategy: Strategy
                 print("      ⚠️ Brak wyników.")
                 continue
 
-            # Aktualizujemy historię o liczbę wyników
             history_entry.results_found = len(items)
             session.commit()
 
-            print(f"      📥 Pobranno {len(items)} firm. Przetwarzanie...")
+            print(f"      📥 Pobranno {len(items)} firm. Analiza duplikatów i karencji...")
 
-            # --- OPTYMALIZACJA BULK (Bez zmian, bo działała dobrze) ---
+            # --- KROK 1: Aktualizacja GlobalCompany ---
             raw_domains = [item.get("website") for item in items if item.get("website")]
             clean_domains = list(set([d for d in [_clean_domain(url) for url in raw_domains] if d]))
             
@@ -153,9 +139,7 @@ async def run_scout_async(session: Session, campaign_id: int, strategy: Strategy
             
             new_companies_to_add = []
             
-            # 1. Dodawanie firm
             for item in items:
-                if total_added >= SAFETY_LIMIT_LEADS: break
                 domain = _clean_domain(item.get("website"))
                 if not domain or domain not in clean_domains: continue
 
@@ -171,48 +155,76 @@ async def run_scout_async(session: Session, campaign_id: int, strategy: Strategy
                         quality_score=int(total_score * 20) if total_score else 50
                     )
                     new_companies_to_add.append(new_company)
-                    existing_domains_map[domain] = new_company
+                    existing_domains_map[domain] = new_company # Dodajemy do mapy tymczasowo
             
             if new_companies_to_add:
                 session.add_all(new_companies_to_add)
                 session.commit()
 
-            # 2. Dodawanie leadów
-            # Pobieramy ID firm
+            # --- KROK 2: Tworzenie Leadów (z Logiką Recyklingu) ---
+            
+            # Pobieramy ID firm po commicie
             current_companies = session.query(GlobalCompany).filter(GlobalCompany.domain.in_(clean_domains)).all()
-            company_id_map = {c.domain: c.id for c in current_companies}
+            company_id_map = {c.domain: c for c in current_companies}
 
-            # Sprawdzamy duplikaty w kampanii
-            existing_leads = session.query(Lead).filter(
+            # Sprawdzamy, czy firma jest JUŻ W TEJ KAMPANII (Lokalny Duplikat)
+            leads_in_this_campaign = session.query(Lead.global_company_id).filter(
                 Lead.campaign_id == campaign_id,
-                Lead.global_company_id.in_(company_id_map.values())
+                Lead.global_company_id.in_([c.id for c in current_companies])
             ).all()
-            existing_lead_ids = {l.global_company_id for l in existing_leads}
+            ids_in_this_campaign = {l[0] for l in leads_in_this_campaign}
             
             new_leads_to_add = []
+            
             for domain in clean_domains:
                 if total_added >= SAFETY_LIMIT_LEADS: break
-                comp_id = company_id_map.get(domain)
-                if not comp_id: continue
+                
+                company_obj = company_id_map.get(domain)
+                if not company_obj: continue
 
-                if comp_id not in existing_lead_ids:
-                    company_obj = existing_domains_map.get(domain)
-                    score = company_obj.quality_score if company_obj else 50
+                # A. Sprawdzenie Lokalnego Duplikatu (Czy już mielimy tę firmę TERAZ?)
+                if company_obj.id in ids_in_this_campaign:
+                    # print(f"      🔹 {domain}: Już jest w bieżącej kampanii.")
+                    continue
 
-                    new_lead = Lead(
-                        campaign_id=campaign_id,
-                        global_company_id=comp_id,
-                        status="NEW",
-                        ai_confidence_score=score
-                    )
-                    new_leads_to_add.append(new_lead)
-                    existing_lead_ids.add(comp_id)
-                    total_added += 1
+                # B. GLOBALNE SPRAWDZENIE KARENCJI (Czy wysłano maila niedawno?)
+                # Szukamy ostatniego wysłanego maila do tej firmy (z dowolnej kampanii/klienta)
+                last_contact = session.query(Lead).filter(
+                    Lead.global_company_id == company_obj.id,
+                    Lead.status == "SENT"
+                ).order_by(desc(Lead.sent_at)).first()
+
+                if last_contact and last_contact.sent_at:
+                    # Obliczamy ile dni minęło
+                    days_since = (datetime.now() - last_contact.sent_at).days
+                    
+                    if days_since < GLOBAL_CONTACT_COOLDOWN:
+                        print(f"      ⏳ {domain}: KARENCJA (Kontakt {days_since} dni temu). Pomijam.")
+                        continue
+                    else:
+                        print(f"      ♻️ {domain}: RECYKLING (Kontakt > {GLOBAL_CONTACT_COOLDOWN} dni). Dodaję ponownie!")
+                
+                # Jeśli przeszliśmy tutaj -> Dodajemy Leada (Jako NEW)
+                score = company_obj.quality_score if company_obj.quality_score else 50
+                
+                new_lead = Lead(
+                    campaign_id=campaign_id,
+                    global_company_id=company_obj.id,
+                    status="NEW",
+                    ai_confidence_score=score
+                )
+                new_leads_to_add.append(new_lead)
+                
+                # Blokujemy dodanie tego samego w tej samej pętli
+                ids_in_this_campaign.add(company_obj.id) 
+                total_added += 1
 
             if new_leads_to_add:
                 session.add_all(new_leads_to_add)
                 session.commit()
-                print(f"      💾 Dodano {len(new_leads_to_add)} nowych leadów.")
+                print(f"      💾 Dodano {len(new_leads_to_add)} nowych leadów (w tym z recyklingu).")
+            else:
+                print("      💨 Brak nowych szans (tylko duplikaty lub karencja).")
 
         except Exception as e:
             session.rollback()

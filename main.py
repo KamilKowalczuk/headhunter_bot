@@ -6,6 +6,8 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from rich.console import Console
+import random 
+from app.agents.sender import send_email_via_smtp 
 
 # Konfiguracja ścieżek i loggera
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -20,16 +22,16 @@ from app.agents.researcher import analyze_lead
 from app.agents.writer import generate_email
 from app.scheduler import process_followups, save_draft_via_imap
 from app.agents.inbox import check_inbox
+from app.warmup import calculate_daily_limit # <--- NOWY IMPORT
 
 # --- POMOCNICZE FUNKCJE ---
 
 def get_today_progress(session, client):
     """Zwraca liczbę maili wysłanych dzisiaj PRZEZ TEGO KONKRETNEGO KLIENTA."""
-    # POPRAWKA DATY: Używamy daty serwera (lokalnej), żeby pasowało do bazy
     today = datetime.now().date()
     
     sent_count = session.query(Lead).join(Campaign).filter(
-        Campaign.client_id == client.id, # <--- KLUCZOWE: Filtr po ID klienta
+        Campaign.client_id == client.id,
         Lead.status == "SENT",
         func.date(Lead.sent_at) == today
     ).count()
@@ -47,15 +49,20 @@ async def run_client_cycle(client_id: int):
         if not client or client.status != "ACTIVE":
             return False
 
-        # 2. SPRAWDZENIE LIMITÓW
-        limit = client.daily_limit or 50
+        # 2. SPRAWDZENIE LIMITÓW (WARM-UP LOGIC)
+        # Obliczamy limit dynamicznie na podstawie stażu w warm-upie
+        limit = calculate_daily_limit(client)
         done_today = get_today_progress(session, client)
         
-        # LOGOWANIE STANU (Teraz będziesz widział to w logach)
-        console.print(f"[dim]📊 {client.name}: Postęp wysyłki {done_today}/{limit}[/dim]")
+        # Logowanie stanu z informacją o Warm-upie
+        limit_str = f"{limit}"
+        if client.warmup_enabled and limit < (client.daily_limit or 50):
+            limit_str += " (Warm-up 🔥)"
+            
+        console.print(f"[dim]📊 {client.name}: Postęp wysyłki {done_today}/{limit_str}[/dim]")
 
         if done_today >= limit:
-            console.print(f"[dim]🛑 {client.name}: Limit wyczerpany na dziś ({done_today}/{limit}).[/dim]")
+            console.print(f"[dim]🛑 {client.name}: Limit dzienny osiągnięty ({done_today}/{limit}).[/dim]")
             return False
 
         # ---------------------------------------------------------
@@ -68,19 +75,49 @@ async def run_client_cycle(client_id: int):
         # FAZA 1: EGZEKUCJA (Konsumpcja)
         # ---------------------------------------------------------
 
-        # C. WYSYŁKA
+        # C. WYSYŁKA / DRAFTOWANIE
         draft = session.query(Lead).join(Campaign).filter(
             Campaign.client_id == client.id, 
             Lead.status == "DRAFTED"
         ).first()
         
         if draft:
-            console.print(f"[green]🚀 {client.name}:[/green] Wysyłam draft do {draft.company.name}...")
-            success, info = await asyncio.to_thread(save_draft_via_imap, draft, client)
-            if success:
-                draft.status = "SENT"
-                draft.sent_at = datetime.now()
-                session.commit()
+            # SPRAWDZAMY TRYB WYSYŁKI
+            mode = getattr(client, "sending_mode", "DRAFT")
+            
+            if mode == "AUTO":
+                console.print(f"[bold green]🚀 {client.name}:[/bold green] WYSYŁAM (AUTO) do {draft.company.name}...")
+                
+                # Symulacja człowieka przed kliknięciem "Wyślij" (3-10 sekund "wahania")
+                await asyncio.sleep(random.randint(3, 10))
+                
+                success = await asyncio.to_thread(send_email_via_smtp, draft, client)
+                
+                if success:
+                    draft.status = "SENT"
+                    draft.sent_at = datetime.now()
+                    session.commit()
+                    console.print(f"   ✅ Wysłano! Następny mail za chwilę...")
+                    
+                    # === HUMAN JITTER ===
+                    # Po wysłaniu maila człowiek nie wysyła następnego natychmiast.
+                    # Czeka od 2 do 8 minut.
+                    wait_time = random.randint(120, 480) 
+                    console.print(f"   ☕ Przerwa na kawę: {wait_time}s (Symulacja człowieka)")
+                    await asyncio.sleep(wait_time)
+                    
+                else:
+                    console.print(f"   ❌ Błąd wysyłki SMTP.")
+            
+            else:
+                # TRYB DRAFT (Bezpieczny)
+                console.print(f"[green]💾 {client.name}:[/green] Zapisuję draft (IMAP) dla {draft.company.name}...")
+                success, info = await asyncio.to_thread(save_draft_via_imap, draft, client)
+                if success:
+                    draft.status = "SENT" # W trybie draft traktujemy zapisanie jako "obsłużenie"
+                    draft.sent_at = datetime.now()
+                    session.commit()
+            
             return True
 
         # D. PISANIE
@@ -121,28 +158,23 @@ async def run_client_cycle(client_id: int):
             # Generowanie strategii
             strategy = await asyncio.to_thread(generate_strategy, client, campaign.strategy_prompt, campaign.id)
             
-            # --- FIX: ZABEZPIECZENIE PRZED NoneType ---
-            # Sprawdzamy czy strategy istnieje ORAZ czy search_queries to lista (i nie jest None)
+            # Zabezpieczenie przed pustą strategią (NoneType fix)
             if strategy and hasattr(strategy, 'search_queries') and strategy.search_queries:
-                # Bierzemy max 2 zapytania
                 strategy.search_queries = strategy.search_queries[:2]
-                
                 console.print(f"[yellow]   🔍 Cele: {strategy.search_queries}[/yellow]")
                 await run_scout_async(session, campaign.id, strategy)
                 return True
             else:
-                console.print(f"[red]⚠️ {client.name}:[/red] AI zwróciło pustą strategię. Próbuję ponownie za chwilę.")
-                # Nie zwracamy błędu, tylko False, żeby system spróbował w następnym cyklu
+                console.print(f"[red]⚠️ {client.name}:[/red] AI nie wygenerowało fraz. Ponawiam w następnym cyklu.")
                 return False
         else:
             console.print(f"[red]❌ {client.name}:[/red] Brak aktywnej kampanii (celu).")
             return False
 
     except Exception as e:
-        # Dodajemy pełny zrzut błędu, żeby łatwiej debugować
-        import traceback
         console.print(f"[bold red]💥 BŁĄD KRYTYCZNY KLIENTA {client_id}: {e}[/bold red]")
-        # console.print(traceback.format_exc()) # Odkomentuj jeśli chcesz widzieć pełny stos błędów
+        # import traceback
+        # console.print(traceback.format_exc()) 
         return False
     finally:
         session.close()
@@ -179,9 +211,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        # Wymuszenie flushowania stdout dla Windows/Linux (KLUCZOWE DLA LOGÓW LIVE)
         sys.stdout.reconfigure(line_buffering=True)
-        
         if sys.platform == 'win32':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(main())

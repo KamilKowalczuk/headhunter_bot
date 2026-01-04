@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+from datetime import datetime
 from sqlalchemy.orm import Session
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -46,13 +47,15 @@ def _generate_email_sync(session: Session, lead_id: int):
     client = lead.campaign.client
     company = lead.company
     
-    logger.info(f"✍️  [WRITER] Piszę dla {company.name} (Step {lead.step_number})...")
+    # Pobieramy tryb działania (SALES lub JOB_HUNT)
+    mode = getattr(client, "mode", "SALES")
+    
+    logger.info(f"✍️  [WRITER {mode}] Piszę dla {company.name} (Step {lead.step_number})...")
 
     # --- 1. PRZYGOTOWANIE PERSONY (DECYDENTA) ---
     decision_maker_name = "Zespole"
     dm_data = company.decision_makers
     
-    # Zabezpieczenie przed None w decision_makers
     if dm_data:
         try:
             first_dm = dm_data[0] if isinstance(dm_data, list) and len(dm_data) > 0 else str(dm_data)
@@ -73,7 +76,8 @@ def _generate_email_sync(session: Session, lead_id: int):
             company=company, 
             decision_maker=decision_maker_name, 
             lead_summary=lead.ai_analysis_summary or "Brak danych z researchu.", 
-            step=lead.step_number
+            step=lead.step_number,
+            mode=mode # Przekazujemy tryb
         )
     except Exception as e:
         logger.error(f"❌ Błąd AI Writera: {e}")
@@ -86,9 +90,6 @@ def _generate_email_sync(session: Session, lead_id: int):
     final_status = "DRAFTED"
     score = 85
     
-    # (Opcjonalnie: Tu można włączyć pętlę poprawkową Audytora)
-    # Na razie upraszczamy, żeby działało stabilnie
-    
     # --- 4. ZAPIS WYNIKU ---
     lead.generated_email_subject = draft.subject
     lead.generated_email_body = draft.body
@@ -97,21 +98,18 @@ def _generate_email_sync(session: Session, lead_id: int):
     if lead.status != "MANUAL_CHECK":
         lead.status = final_status
     
-    lead.last_action_at = datetime.utcnow() # Aktualizacja czasu
+    lead.last_action_at = datetime.now()
     session.commit()
     logger.info(f"   💾 Zapisano draft: '{draft.subject}'")
 
-from datetime import datetime # Dodany import brakujący w funkcji wyżej
 
-def _call_writer(client, company, decision_maker, lead_summary, step=1, feedback=None):
+def _call_writer(client, company, decision_maker, lead_summary, step=1, feedback=None, mode="SALES"):
     """
-    ENGINE: Silnik generujący treść.
+    ENGINE: Silnik generujący treść (Polimorficzny: SALES / JOB_HUNT).
     """
-    # --- FIX: ZABEZPIECZENIE DANYCH (Safe Get) ---
     sender = client.sender_name or "Zespół"
     uvp = client.value_proposition or "Wsparcie B2B"
-    # Jeśli case_studies jest None, zamień na pusty string, żeby [:200] nie wywaliło błędu
-    cases = client.case_studies or "" 
+    cases = client.case_studies or ""
     tone = client.tone_of_voice or "Profesjonalny"
     constraints = client.negative_constraints or "Brak"
     
@@ -126,46 +124,76 @@ def _call_writer(client, company, decision_maker, lead_summary, step=1, feedback
     else:
         signature_instruction = f"Zakończ maila profesjonalnym podpisem tekstowym: {sender}."
 
-    if step == 1:
-        strategy_prompt = f"""
-        RODZAJ: COLD EMAIL (Initial Outreach)
-        STRUKTURA: "The Bridge Model" (Icebreaker -> Problem -> Rozwiązanie -> CTA)
-        CEL: Sprzedać ROZMOWĘ, a nie produkt.
-        DŁUGOŚĆ: Krótko (max 100-120 słów). Szanuj czas CEO.
+    if mode == "JOB_HUNT":
+        # --- TRYB REKRUTACJI ---
+        system_role = f"""
+        Jesteś Specjalistą ds. Aplikacji o Pracę (Job Hunter).
+        Piszesz w imieniu Kandydata: {sender}.
         
-        INSTRUKCJE SPECJALNE:
-        1. **ICEBREAKER**: Zacznij od odniesienia się do firmy: "Cześć {decision_maker}".
-        2. **PROBLEM**: Nawiąż do branży (z analizy).
-        3. **DOWÓD**: Wykorzystaj Case Study (jeśli pasuje): "{cases[:200]}..."
-        4. **CTA**: Niskie ryzyko. Np. "Warto pogadać?".
+        TWOJE BIO (UVP): {uvp}
+        TWOJE DOŚWIADCZENIE (Case Studies): {cases[:300]}
+        TONE: {tone} (np. "Pewny siebie, ale pokorny").
         """
-    elif step == 2:
-        strategy_prompt = f"""
-        RODZAJ: FOLLOW-UP (Przypomnienie)
-        STRUKTURA: "Quick Bump"
-        TREŚĆ: "Cześć {decision_maker}, podbijam temat. Czy (krótka korzyść) jest teraz priorytetem?"
-        DŁUGOŚĆ: Ultra krótko (3-4 zdania).
-        """
+        
+        if step == 1:
+            strategy_prompt = f"""
+            RODZAJ: DIRECT APPLICATION (Cold Email do Firmy)
+            STRUKTURA: "Value Match" (Widzę, że robicie X -> Ja umiem X -> Pogadamy?)
+            CEL: Umówić rozmowę rekrutacyjną (lub kawę online).
+            
+            INSTRUKCJE:
+            1. **ICEBREAKER**: "Cześć {decision_maker}, widzę, że mocno rozwijacie się w [Technologia z Researchu]."
+            2. **VALUE**: "Jestem [Twoja Rola]. W ostatnim projekcie [Twoje Case Study]."
+            3. **MATCH**: Podkreśl zgodność Twoich skilli z ich stackiem technologicznym.
+            4. **CTA**: Niskie ryzyko. Np. "Szukacie kogoś do pomocy? Chętnie pokażę kod."
+            """
+        else:
+            strategy_prompt = f"""
+            RODZAJ: FOLLOW-UP (Przypomnienie o Kandydaturze)
+            TREŚĆ: "Cześć {decision_maker}, podbijam temat. Czy rekrutujecie teraz do zespołu [Technologia]?"
+            DŁUGOŚĆ: Ultra krótko.
+            """
+            
     else:
-        strategy_prompt = """
-        RODZAJ: BREAK-UP EMAIL
-        TREŚĆ: "Chyba nie trafiłem w dobry moment. Nie będę więcej męczył."
-        CEL: Zostawić furtkę na przyszłość.
+        # --- TRYB SPRZEDAŻY (STANDARD) ---
+        system_role = f"""
+        Jesteś światowej klasy Copywriterem B2B.
+        Piszesz w imieniu: {sender} z firmy {client.name}.
+        
+        DNA:
+        - UVP: {uvp}
+        - Tone: {tone}
+        - Constraints: {constraints}
         """
+        
+        if step == 1:
+            strategy_prompt = f"""
+            RODZAJ: COLD EMAIL (Initial Outreach)
+            STRUKTURA: "The Bridge Model" (Icebreaker -> Problem -> Rozwiązanie -> CTA)
+            CEL: Sprzedać ROZMOWĘ, a nie produkt.
+            DŁUGOŚĆ: Krótko (max 100-120 słów). Szanuj czas CEO.
+            
+            INSTRUKCJE SPECJALNE:
+            1. **ICEBREAKER**: Zacznij od odniesienia się do firmy: "Cześć {decision_maker}".
+            2. **PROBLEM**: Nawiąż do branży (z analizy).
+            3. **DOWÓD**: Wykorzystaj Case Study (jeśli pasuje): "{cases[:200]}..."
+            4. **CTA**: Niskie ryzyko. Np. "Warto pogadać?".
+            """
+        else:
+            strategy_prompt = f"""
+            RODZAJ: FOLLOW-UP (Przypomnienie)
+            STRUKTURA: "Quick Bump"
+            TREŚĆ: "Cześć {decision_maker}, podbijam temat. Czy (krótka korzyść) jest teraz priorytetem?"
+            """
 
-    system_prompt = f"""
-    Jesteś światowej klasy Copywriterem B2B.
-    Piszesz w imieniu: {sender} z firmy {client.name}.
-    
-    DNA:
-    - UVP: {uvp}
-    - Tone: {tone}
-    - Constraints: {constraints}
+    # --- WSPÓLNY KONIEC ---
+    full_system_prompt = f"""
+    {system_role}
     
     TARGET:
     - Firma: {company.name}
     - Decydent: {decision_maker}
-    - Analiza: {lead_summary}
+    - Analiza Researchera: {lead_summary}
     
     ZADANIE:
     Napisz treść maila zgodnie ze strategią.
@@ -184,7 +212,7 @@ def _call_writer(client, company, decision_maker, lead_summary, step=1, feedback
     if feedback:
         user_message += f"\n\n🚨 KOREKTA: Audytor zgłosił: '{feedback}'. Popraw."
 
-    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", user_message)])
+    prompt = ChatPromptTemplate.from_messages([("system", full_system_prompt), ("human", user_message)])
     return (prompt | writer_llm).invoke({})
 
 def _call_auditor(draft, company, client):
