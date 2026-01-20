@@ -19,13 +19,15 @@ load_dotenv()
 # Modele AI
 writer_llm = ChatGoogleGenerativeAI(
     model="gemini-2.0-flash",
-    temperature=0.85, # Podkręcamy kreatywność dla bardziej ludzkiego stylu
+    temperature=0.72,
+    top_p=0.85,
+    top_k=40,
     google_api_key=os.getenv("GEMINI_API_KEY")
 ).with_structured_output(EmailDraft)
 
 auditor_llm = ChatGoogleGenerativeAI(
     model="gemini-2.0-flash",
-    temperature=0.0, # Zero tolerancji dla błędów
+    temperature=0.0,
     google_api_key=os.getenv("GEMINI_API_KEY")
 ).with_structured_output(AuditResult)
 
@@ -35,7 +37,8 @@ def _sanitize_and_validate_html(html_content: str) -> str:
     Naprawia i czyści HTML wygenerowany przez AI.
     Chroni przed rozsypaniem się maila w Outlooku.
     """
-    if not html_content: return ""
+    if not html_content:
+        return ""
 
     # 1. Usuwanie niebezpiecznych tagów
     forbidden_tags = [r'<script.*?>.*?</script>', r'<iframe.*?>.*?</iframe>', r'<object.*?>.*?</object>', r'<style.*?>.*?</style>']
@@ -52,13 +55,160 @@ def _sanitize_and_validate_html(html_content: str) -> str:
         
         if open_count > close_count:
             missing = open_count - close_count
-            # logger.warning(f"⚠️ [HTML FIX] Brakuje {missing} zamknieć dla <{tag}>. Doklejam.")
             clean_html += f"</{tag}>" * missing
 
     # 3. Usuwanie wielokrotnych <br>
     clean_html = re.sub(r'(<br\s*/?>){3,}', '<br><br>', clean_html)
     
     return clean_html.strip()
+
+
+def _extract_name_from_email(email: str) -> str:
+    """Wyciąga imię z email (marta@firma.pl → Marta)."""
+    if not email:
+        return ""
+    
+    try:
+        prefix = email.split('@')[0].lower()
+        # Usuń liczby i znaki specjalne
+        name = re.sub(r'[0-9._-]', ' ', prefix).strip()
+        # Weź pierwsze słowo
+        first_word = name.split()[0] if name.split() else ""
+        # Kapitalizuj
+        return first_word.capitalize() if len(first_word) > 2 else ""
+    except:
+        return ""
+
+
+def _extract_decision_maker_name(dm_data) -> tuple:
+    """
+    Wyciąga imię decydenta z research.
+    Returns: (name, confidence_score)
+    """
+    if not dm_data:
+        return None, 0
+    
+    try:
+        if isinstance(dm_data, list) and len(dm_data) > 0:
+            first = dm_data[0]
+            if isinstance(first, dict):
+                name_str = first.get('name', '')
+            else:
+                name_str = str(first)
+        else:
+            name_str = str(dm_data)
+        
+        if not name_str:
+            return None, 0
+        
+        # Parse: "Marta Kowalska (CEO)" → "Marta"
+        name_clean = name_str.split('(')[0].split(',')[0].strip()
+        first_name = name_clean.split(' ')[0]
+        
+        if len(first_name) > 2:
+            return first_name, 70
+        else:
+            return None, 0
+    except Exception as e:
+        logger.warning(f"Decision maker parse error: {e}")
+        return None, 0
+
+
+def _match_email_to_decision_maker(email: str, decision_maker_name: str) -> tuple:
+    """
+    Inteligentne dopasowanie email → decision maker.
+    Returns: (greeting_name, confidence_score)
+    
+    STRATEGY DLA MAKSYMALNEJ OTWIERALNOŚCI:
+    - Jeśli mamy imię z research → ZAWSZE używaj
+    - Jeśli generic email (kontakt@, info@) → Skip greeting, ale zacznij od hook'a
+    - Jeśli email prefix to imię → użyj
+    - Fallback: Start z hook'a bez powitania
+    """
+    
+    # Extract imię z email
+    email_name = _extract_name_from_email(email)
+    
+    # Check czy to generic mailbox
+    generic_prefixes = ['kontakt', 'info', 'biuro', 'support', 'hello', 
+                        'mail', 'contact', 'no-reply', 'noreply', 'team', 'sales', 'business']
+    if email_name and email_name.lower() in generic_prefixes:
+        logger.info(f"   🎯 Generic email detected: {email} → Skip greeting, start with hook")
+        return None, 0
+    
+    # PRIORITY 1: Research decision maker (70% confidence = good enough)
+    if decision_maker_name:
+        logger.info(f"   ✅ Using research DM: {decision_maker_name}")
+        return decision_maker_name, 85  # Lift to 85% - research is valuable
+    
+    # PRIORITY 2: Email prefix (if not generic)
+    if email_name and len(email_name) > 2:
+        logger.info(f"   📧 Using email prefix: {email_name}")
+        return email_name, 75
+    
+    # PRIORITY 3: No name available
+    logger.info(f"   ⚠️ No name found, starting with hook")
+    return None, 0
+
+
+
+def _detect_hallucination_markers(text: str) -> list:
+    """Detektuje znaki halucynacji (placeholders, niespójności)."""
+    markers = []
+    
+    # CRITICAL: Placeholder detection
+    if re.search(r'\[.*?\]', text):
+        markers.append("placeholder_detected")
+        logger.error("   🚨 PLACEHOLDER FOUND - REGENERATING")
+    
+    if re.search(r'\{.*?\}', text):
+        markers.append("curly_placeholder_detected")
+        logger.error("   🚨 CURLY PLACEHOLDER FOUND - REGENERATING")
+    
+    # Generic corporate speak
+    generic_phrases = [
+        r'mamy przyjemność',
+        r'wychodzimy naprzeciw',
+        r'kompleksowe rozwiązania',
+        r'w dzisiejszych czasach',
+        r'transformacja cyfrowa',
+        r'innowacyjne podejście'
+    ]
+    
+    for phrase in generic_phrases:
+        if re.search(phrase, text, re.IGNORECASE):
+            markers.append(f"generic_phrase: {phrase}")
+    
+    # Repeated patterns
+    words = text.split()
+    if len(words) > 10:
+        word_freq = {}
+        for word in words:
+            word_freq[word] = word_freq.get(word, 0) + 1
+        
+        if max(word_freq.values()) > 5:
+            markers.append("word_repetition_detected")
+    
+    return markers
+
+
+def _validate_against_data(email_body: str, company_data: dict, client_data: dict) -> dict:
+    """Sprawdza czy mail nie halucynuje."""
+    validation_result = {
+        "is_hallucinating": False,
+        "violations": [],
+        "confidence_score": 100
+    }
+    
+    # Hallucination markers
+    hallucination_markers = _detect_hallucination_markers(email_body)
+    if hallucination_markers:
+        validation_result["is_hallucinating"] = True
+        validation_result["violations"].extend(hallucination_markers)
+        validation_result["confidence_score"] -= 50
+    
+    return validation_result
+
 # -------------------------------------------
 
 def generate_email(session: Session, lead_id: int):
@@ -83,200 +233,264 @@ def _generate_email_sync(session: Session, lead_id: int):
     
     logger.info(f"✍️  [WRITER {mode}] Piszę dla {company.name} (Step {lead.step_number})...")
 
-    # --- 1. PRZYGOTOWANIE PERSONY (DECYDENTA) ---
-    decision_maker_name = "Zespole" # Domyślnie
-    dm_data = company.decision_makers
-    
-    # Próba wyciągnięcia imienia
-    if dm_data:
-        try:
-            # Jeśli to lista obiektów [{'name': 'Jan'}]
-            if isinstance(dm_data, list) and len(dm_data) > 0:
-                first = dm_data[0]
-                if isinstance(first, dict):
-                    name_str = first.get('name', str(first))
-                else:
-                    name_str = str(first)
-            else:
-                name_str = str(dm_data)
-                
-            # Czyszczenie (Jan Kowalski (CEO) -> Jan)
-            name_clean = name_str.split('(')[0].split(',')[0].strip()
-            first_name = name_clean.split(' ')[0]
-            if len(first_name) > 2: # Zabezpieczenie przed skrótami
-                decision_maker_name = first_name
-                
-        except Exception as e:
-            logger.warning(f"Błąd parsowania decydenta: {e}")
-            decision_maker_name = "Zespole"
+    # --- 1. EXTRACT RESEARCH DECISION MAKER ---
+    research_dm_name, dm_confidence = _extract_decision_maker_name(company.decision_makers)
+    logger.info(f"   🔍 Research DM: {research_dm_name} (confidence: {dm_confidence}%)")
 
-    # --- 2. GENEROWANIE TREŚCI (ITERACJA 1) ---
+    # --- 2. EMAIL-TO-NAME MATCHING ---
+    # --- 2. EMAIL-TO-NAME MATCHING ---
+    target_email = lead.target_email or ""
+    greeting_name, email_confidence = _match_email_to_decision_maker(
+        email=target_email,
+        decision_maker_name=research_dm_name
+    )
+    
+    # FALLBACK: Jeśli nic nie ma, użyj imienia z researchu
+    if not greeting_name and research_dm_name:
+        greeting_name = research_dm_name
+        email_confidence = 85
+        logger.info(f"   🔄 Fallback to research DM: {greeting_name}")
+    
+    logger.info(f"   📧 Final greeting: {greeting_name} (confidence: {email_confidence}%)")
+
+
+    # --- 3. SENDER INFO ---
+    sender_name = client.sender_name or None
+    sender_company = client.name or None
+    
+    if sender_name and sender_company:
+        sender_info = f"{sender_name} @ {sender_company}"
+    elif sender_name:
+        sender_info = sender_name
+    else:
+        sender_info = None
+    
+    logger.info(f"   👤 Sender: {sender_info}")
+
+    # --- 4. FOOTER CHECK ---
+    has_footer = bool(getattr(client, "html_footer", None))
+    logger.info(f"   📎 Footer available: {has_footer}")
+
+    # --- 5. GENERATE EMAIL ---
     try:
         draft = _call_writer(
-            client=client, 
-            company=company, 
-            decision_maker=decision_maker_name, 
-            lead_summary=lead.ai_analysis_summary or "Brak specyficznych danych.", 
+            client=client,
+            company=company,
+            greeting_name=greeting_name,
+            research_dm_name=research_dm_name,
+            lead_summary=lead.ai_analysis_summary or "Brak specyficznych danych.",
             step=lead.step_number,
-            mode=mode
+            mode=mode,
+            sender_name=sender_name,
+            sender_company=sender_company,
+            has_footer=has_footer
         )
     except Exception as e:
-        logger.error(f"❌ Błąd AI Writera: {e}")
+        logger.error(f"❌ Writer error: {e}")
         return
     
-    # --- 3. SAFETY NET: WALIDACJA HTML ---
+    # --- 6. VALIDATE HTML ---
     safe_body = _sanitize_and_validate_html(draft.body)
 
-    # Można tu dodać krok Auditora (_call_auditor), ale dla szybkości pomijam w tym zrzucie, 
-    # zakładając, że prompt Writera jest wystarczająco silny.
+    # --- 7. HALLUCINATION CHECK ---
+    validation = _validate_against_data(
+        safe_body,
+        {'tech_stack': company.tech_stack, 'pain_points': company.pain_points},
+        {'case_studies': client.case_studies}
+    )
     
-    score = 85 # Domyślny wysoki score dla v2.0
+    if validation["is_hallucinating"]:
+        logger.warning(f"⚠️  HALLUCINATION DETECTED: {validation['violations']}")
+        logger.info(f"   🔄 Regenerating with strict mode...")
+        
+        draft = _call_writer(
+            client=client,
+            company=company,
+            greeting_name=greeting_name,
+            research_dm_name=research_dm_name,
+            lead_summary=lead.ai_analysis_summary or "Brak specyficznych danych.",
+            step=lead.step_number,
+            mode=mode,
+            sender_name=sender_name,
+            sender_company=sender_company,
+            has_footer=has_footer,
+            strict_mode=True
+        )
+        safe_body = _sanitize_and_validate_html(draft.body)
+        validation = _validate_against_data(safe_body, {}, {})
+
+    score = validation["confidence_score"]
     
-    # --- 4. ZAPIS WYNIKU ---
+    # --- 8. SAVE TO DATABASE ---
     lead.generated_email_subject = draft.subject
-    lead.generated_email_body = safe_body 
-    lead.ai_confidence_score = score
+    lead.generated_email_body = safe_body
+    lead.ai_confidence_score = int(score)
     
     if lead.status != "MANUAL_CHECK":
         lead.status = "DRAFTED"
     
     lead.last_action_at = datetime.now()
     session.commit()
-    logger.info(f"   💾 Zapisano draft: '{draft.subject}'")
+    logger.info(f"   💾 Draft saved (Confidence: {score:.0f}%): '{draft.subject}'")
 
 
-def _call_writer(client, company, decision_maker, lead_summary, step=1, feedback=None, mode="SALES"):
+def _call_writer(
+    client,
+    company,
+    greeting_name,
+    research_dm_name,
+    lead_summary,
+    step=1,
+    feedback=None,
+    mode="SALES",
+    sender_name=None,
+    sender_company=None,
+    has_footer=False,
+    strict_mode=False
+):
     """
-    ENGINE: Silnik generujący treść. Prawdziwa inżynieria promptu (Protocol: GHOSTWRITER).
+    ENGINE: Silnik generujący treść.
     """
-    sender = client.sender_name or "Kamil"
-    sender_company = client.name
+    
     uvp = client.value_proposition or "Wspieramy firmy B2B"
-    cases = client.case_studies or "Współpracowaliśmy z wieloma firmami."
+    cases = client.case_studies or ""
     tone = client.tone_of_voice or "Profesjonalny, konkretny"
-    constraints = client.negative_constraints or "Brak"
+    constraints = client.negative_constraints or ""
     
-    # Logika stopki (Czy system dokleja?)
-    signature_instruction = ""
-    if getattr(client, "html_footer", None): 
+    # --- GREETING LOGIC ---
+    if greeting_name:
+        greeting_instruction = f"Zacznij: 'Cześć {greeting_name},'"
+    else:
+        greeting_instruction = "Nie używaj powitania - zacznij prosto od hook'a: 'Widzę, że...'"
+    
+    # --- SIGNATURE LOGIC ---
+    if has_footer:
         signature_instruction = (
-            "⛔ ZAKAZ PODPISU: Nie pisz 'Pozdrawiam, [Imię]'. Mail ma się kończyć nagle, po Call to Action lub jednym zdaniu pożegnalnym. Stopka HTML zostanie doklejona automatycznie."
+            "KONIEC MAILA: Mail kończy się TUŻ PO Call to Action lub jednym zdaniu. "
+            "Nie pisz ŻADNEGO podpisu (Pozdrawiam, itp.) - zostanie doklejony automatycznie. "
+            "Ostatnie słowo to albo pytanie albo propozycja."
         )
+    elif sender_name and sender_company:
+        signature_instruction = f"Zakończ maila: 'Pozdrawiam,<br/>{sender_name}<br/>@ {sender_company}'"
+    elif sender_name:
+        signature_instruction = f"Zakończ maila: 'Pozdrawiam,<br/>{sender_name}'"
     else:
-        signature_instruction = f"Zakończ maila: 'Pozdrawiam, {sender}'."
+        signature_instruction = (
+            "Zakończ mail naturalnie - ostatnie zdanie to pytanie lub propozycja, bez podpisu."
+        )
 
-    # --- BUDOWANIE KONTEKSTU ---
-    
-    base_instructions = f"""
-    Jesteś doświadczonym Business Developerem, który nienawidzi "korpo-bełkotu". 
-    Twoim celem jest nawiązanie relacji H2H (Human to Human), a nie B2B.
-    
-    Piszesz do: {company.name}
-    Osoba: {decision_maker} (Jeśli to "Zespole", pisz w liczbie mnogiej).
-    Wiedza o firmie (Research): {lead_summary}
-    
-    TWOJE ZASADY STYLU (NON-NEGOTIABLE):
-    1. **Zero Waty:** Żadnych "mamy przyjemność", "wychodzimy naprzeciw", "kompleksowe rozwiązania". To spam.
-    2. **Casual & Direct:** Pisz tak, jakbyś pisał do kolegi z branży, ale z szacunkiem.
-    3. **Krótko:** CEO czyta maile na telefonie. Max 3-4 krótkie akapity.
-    4. **Ty > Ja:** Skup się na NICH. Użyj słowa "Wy", "Wasz", "Twój" 3x częściej niż "My".
-    """
+    # --- SYSTEM PROMPT ---
+    system_prompt = f"""Jesteś Business Developerem z 15-letnim doświadczeniem w sprzedaży B2B.
+Pisz maile, które wyglądają jak napisane przez człowieka, który spędził 30-60 minut na research i drafting.
 
+TONE: Casual, direct, curious, humble, human. Słowa: "myślę", "chyba", "może".
+NEVER: "mamy przyjemność", "wychodzimy naprzeciw", "kompleksowe rozwiązania".
+
+VERIFIED DATA:
+- Company: {company.name}
+- Lead Notes: {lead_summary}
+- Your UVP: {uvp}
+- Cases: {cases if cases else "(Brak)"}
+
+CONSTRAINTS: {constraints if constraints else "(Brak)"}
+
+GREETING: {greeting_instruction}
+SIGNATURE: {signature_instruction}
+
+CRITICAL RULES:
+1. NO placeholders: [imię], {{{{firma}}}}, [data]
+2. NO generic phrases
+3. Use ONLY verified data
+4. If no data about something - SKIP that topic
+5. Max 150 words
+6. Subject line max 4 words"""
+
+    if strict_mode:
+        system_prompt += "\n\nSTRICT MODE: ONLY verified data. No speculation. No guesses."
+
+    # --- TASK PROMPT ---
     if mode == "JOB_HUNT":
-        # --- SCENARIUSZ: SZUKANIE PRACY ---
         if step == 1:
-            task_prompt = f"""
-            RODZAJ: Aplikacja o Pracę (Cold Message)
-            CEL: Zaintrygować CTO/Foundera, żeby otworzył CV.
-            
-            STRUKTURA:
-            1. **The Hook:** Odnieś się do ich tech stacku lub ostatniego sukcesu (z Researchu). Np. "Widziałem, że wchodzicie w AI..."
-            2. **The Value:** Nie pisz "szukam pracy". Napisz "rozwiązuję problemy". Użyj jednego mocnego zdania z Twojego UVP: "{uvp}".
-            3. **The Proof:** "Robiłem podobne rzeczy przy projekcie X."
-            4. **Soft CTA:** "Szukacie teraz rąk do pracy? Mogę podesłać kod."
-            
-            Unikaj tonu błagalnego. Jesteś ekspertem oferującym usługi.
-            """
-        else:
-            task_prompt = f"""
-            RODZAJ: Follow-Up (Lekkie przypomnienie)
-            CEL: Podbić wiadomość na górę skrzynki.
-            
-            TREŚĆ:
-            "Cześć {decision_maker}, podbijam tylko temat, bo pewnie utonął w inboxie.
-            Gdybyście szukali wsparcia w [Technologia z Researchu] - jestem pod ręką."
-            """
+            task_prompt = """SCENARIO: Job Application
 
-    else:
-        # --- SCENARIUSZ: SPRZEDAŻ B2B ---
+STRUCTURE:
+1. Hook (1 line): Something specific from research
+2. Your Superpower (1-2 lines): What you do
+3. Proof (1 line): Specific project or skill
+4. Soft CTA (1 line): "Szukacie teraz?", "Warte dyskusji?"
+
+LENGTH: Max 4 lines. Mobile-readable.
+TONE: "I'm expert, looking for good fit" (not desperate)"""
+        else:
+            task_prompt = """SCENARIO: Follow-Up
+
+STRUCTURE:
+1. Natural continuation
+2. Add NEW value (not just bumping)
+3. Soft touch
+
+TONE: Helpful, assertive"""
+    else:  # SALES
         if step == 1:
-            task_prompt = f"""
-            RODZAJ: Cold Email Sprzedażowy (Otwarcie)
-            CEL: Sprawić, by odpisali "Tak, pogadajmy".
-            
-            STRATEGIA "RELEVANCE FIRST":
-            1. **Subject Line:** Musi być intrygujący, nie sprzedażowy. Np. "Pytanie o [Technologia]", "Współpraca z {company.name}?", "Pomysł na [Problem]".
-               MA BYĆ KRÓTKI (max 4 słowa).
-            
-            2. **Body:**
-               - **Hook:** "Cześć {decision_maker}, przeglądałem Waszą stronę i widzę, że [Wstaw coś konkretnego z researchu - np. używają technologii X, rekrutują, rosną]."
-               - **Bridge:** "Wiele software house'ów (lub firm z ich branży) ma teraz wyzwanie z [Problem z UVP]."
-               - **Solution (Ty):** "{uvp}. Pomagamy w tym, np. ostatnio dla [Case Study] zrobiliśmy [Wynik]."
-               - **CTA:** "Macie 10 minut w czwartek, żeby zderzyć myśli?" (Lub inne konkretne, ale luźne CTA).
-            
-            Użyj danych z researchu ({lead_summary}), aby to uwiarygodnić. Jeśli wiesz, że używają Reacta, wspomnij o tym.
-            """
-        else:
-            task_prompt = f"""
-            RODZAJ: Follow-Up (Wartość dodana)
-            CEL: Przypomnienie + Nowa wartość.
-            
-            TREŚĆ:
-            "Cześć {decision_maker}, myślałem jeszcze o Waszym projekcie.
-            Często przy [Problem] sprawdza się podejście [Krótka rada/Case].
-            
-            Warto o tym pogadać?
-            {sender}"
-            """
+            task_prompt = """SCENARIO: Cold Email (OPENING)
 
-    full_prompt = f"""
-    {base_instructions}
-    
-    TWOJE ZADANIE:
-    {task_prompt}
-    
-    WAŻNE ZAKAZY (Constraints):
-    {constraints}
-    
-    {signature_instruction}
-    
-    Generuj wynik w formacie JSON (Subject + Body HTML).
-    """
-    
-    user_message = "Generuj wiadomość."
+SUBJECT: Intriguing, not salesy. Max 4 words. Examples: "React i wydajność?", "Skalowanie?", "Może się przyda"
+
+BODY:
+- Hook (1 line): "Widzę, że używacie X", "Wiele zespołów ma problem z Y", "Chyba ostatnio się rozszerzyliście?"
+- Bridge (1-2 lines): Show you understand their challenge
+- Offer (1-2 lines): "Pomagamy w X", "Robimy Y"
+- CTA (1 line): "Macie 15 minut?", "Opowiedz - jak wygląda Wasz proces?"
+
+LENGTH: 100-150 words. Phone-readable.
+TONE: Colleague from industry, not salesman"""
+        else:
+            task_prompt = """SCENARIO: Follow-Up
+
+STRUCTURE:
+1. Natural continuation
+2. NEW insight/observation/advice (not just bumping)
+3. Soft CTA
+
+TONE: Helpful, not pushy"""
+
+    full_prompt = system_prompt + "\n\n" + task_prompt
+
+    user_message = "Generuj email subject + body (HTML). Zero placeholders. Verified data only."
     if feedback:
-        user_message += f"\n\nPOPRAWKA (Feedback od Audytora): {feedback}"
+        user_message += f"\n\nFeedback: {feedback}"
 
-    prompt = ChatPromptTemplate.from_messages([("system", full_prompt), ("human", user_message)])
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", full_prompt),
+        ("human", user_message)
+    ])
+
     return (prompt | writer_llm).invoke({})
+
 
 def _call_auditor(draft, company, client):
     """
-    Opcjonalny krok weryfikacji. 
-    W tej wersji kodu nieużywany w głównym flow dla szybkości, 
-    ale gotowy do podpięcia.
+    Opcjonalny krok weryfikacji.
     """
-    system_prompt = f"""
-    Jesteś krytycznym korektorem. Oceniasz maila sprzedażowego.
-    
-    ZASADY:
-    1. Czy brzmi jak człowiek? (Jeśli brzmi jak ChatGPT -> REJECT).
-    2. Czy temat jest krótki?
-    3. Czy nie ma placeholderów typu [Wstaw nazwę]?
-    
-    Mail:
-    Temat: {draft.subject}
-    Treść: {draft.body}
-    """
-    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "Oceń.")])
+    system_prompt = f"""Jesteś krytycznym korektorem emaili.
+
+CRITERIA:
+1. Human-like: Czy brzmi jak człowiek?
+2. Specific: Concrete details from research
+3. No hallucinations: All verified data
+4. Mobile-readable: Short paragraphs
+5. Clear CTA: Do they know what to do?
+
+SCORING: 0-100 (90+ = send, 70-89 = improve, <70 = reject)"""
+
+    user_prompt = f"""Subject: {draft.subject}
+Body: {draft.body}
+
+Oceń i daj konkretny feedback."""
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", user_prompt)
+    ])
+
     return (prompt | auditor_llm).invoke({})
